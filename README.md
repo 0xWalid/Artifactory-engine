@@ -1,14 +1,95 @@
-# 🏴‍☠️ Artifactory Security Engine Project
+Markdown
+# 🏴‍☠️ Artifactory Security Engine
 
-An autonomous, multi-agent security analysis engine built on the Sovereign Blackboard Architecture. Inspired by multi-agent emergent collaboration patterns.
+**Artifactory** is a practitioner-first, multi-agent security analysis engine built around a **Sovereign Blackboard Architecture**. Designed for AI-assisted penetration testing and bug hunting, it structures LLM execution into deterministic recon, dynamic playbook selection, and context-isolated tool execution.
+
+Instead of throwing unconstrained CLI outputs directly into LLM context windows or letting AI run loose on production infrastructure, Artifactory uses local execution safety wrappers, strict scope enforcement, and pointer-based log management.
+
+---
+
+## 💡 Why Artifactory? (The Architecture Edge)
+
+Most AI security tools fail in real-world engagements because they either overload the LLM context window with thousands of lines of terminal output or lack strict guardrails, leading to out-of-scope testing. Artifactory solves this with four core principles:
+
+| Architectural Feature | Traditional AI Wrapper | Artifactory Engine |
+| :--- | :--- | :--- |
+| **Scope Safety** | Relies on system prompts (fails under jailbreaks) | Hard-gated local checks (`sec_flow.py`) against `scope.json` before any command runs. |
+| **Context Management** | Dumps raw stdout/stderr straight into context | Saves raw CLI logs to `.blackboard/artifacts/` and feeds lightweight pointer IDs (`[MSG_XXXX]`) to the LLM. |
+| **Playbook Mechanics** | Generates unverified, hallucinated commands | Executes pre-tested markdown tradecraft playbooks from `prompts/` via `playbook_engine.py`. |
+| **Multi-Agent Flow** | Single monolithic prompt loop | Blackboard pattern: Specialized sub-agents share a unified local state file (`board.json`). |
+
+---
 
 ## 📁 Repository Structure
 
 ```text
 artifactory-engine/
-├── install.sh         <-- Automated Root Installer
-├── README.md          <-- Project Documentation
-└── artifactory/       <-- Core Engine & Playbooks
-    ├── sec_flow.py
-    ├── playbook_engine.py
-    └── prompts/
+├── install.sh                  <-- Automated setup script
+├── README.md                   <-- Engine documentation
+└── artifactory/                <-- Core Engine Subfolder
+    ├── sec_flow.py             <-- Execution wrapper & scope gate
+    ├── playbook_engine.py      <-- Tradecraft playbook loader
+    ├── .blackboard/            <-- Local state, scope rules & artifacts
+    │   ├── scope.json
+    │   ├── board.json
+    │   └── artifacts/          <-- Raw execution logs
+    └── prompts/                <-- Specialized Playbook Libraries
+        ├── web/                <-- Web app tradecraft (IDOR, Smuggling, XSS)
+        ├── api/                <-- REST, GraphQL, gRPC playbooks
+        ├── cloud/              <-- AWS, Azure, IAM misconfiguration vectors
+        └── network/            <-- Service enumeration, port vectors
+🚀 One-Command Automated Installation
+Artifactory installs itself automatically and registers directly into OpenCode as a slash command (/artifactory).
+
+Bash
+git clone [https://github.com/YOUR_USERNAME/artifactory-engine.git](https://github.com/YOUR_USERNAME/artifactory-engine.git)
+cd artifactory-engine
+./install.sh
+What install.sh Does Automatically:
+Links ~/artifactory directly to artifactory-engine/artifactory for unified paths.
+
+Initializes local storage directories (.blackboard/artifacts/).
+
+Makes wrapper scripts (sec_flow.py, playbook_engine.py) executable.
+
+Registers /artifactory in ~/.config/opencode/commands/artifactory.md.
+
+🛠 Target Workflows & Use Cases
+1. Autonomous Attack Surface Recon & Priority Mapping
+Scenario: Starting a new engagement or bug bounty target with zero prior context.
+
+Command:
+
+Plaintext
+/artifactory analyze target.com
+Execution Flow:
+
+Phase 0 (Scope Prompt): The engine pauses and explicitly asks for in-scope assets, out-of-scope rules, rate limits, and custom auth headers. Updates .blackboard/scope.json.
+
+Phase 1 (Reconnaissance): sec_flow.py runs passive asset enumeration, DNS mapping, and HTTP probing.
+
+Phase 2 (Priority Matrix): Evaluates subdomains, unusual ports, and technology stacks to surface high-yield business logic targets.
+
+Phase 3 (Playbook Execution): Loads corresponding playbooks from prompts/ to test identified surfaces.
+
+2. Urgent / Targeted Single-Vector Testing
+Scenario: You suspect a specific high-severity vulnerability (e.g., HTTP Request Smuggling, GraphQL introspection, or AWS S3 takeover) and want immediate, structured testing.
+
+Command:
+
+Plaintext
+/artifactory test target.com for HTTP Request Smuggling urgently
+Execution Flow:
+
+Confirms target.com against .blackboard/scope.json.
+
+Bypasses broad discovery and queries playbook_engine.py for matching playbooks in prompts/web/.
+
+If a playbook exists, it executes step-by-step verification commands.
+
+If no playbook exists, it prompts the practitioner to define tradecraft, converts it into a markdown playbook, and saves it for future runs.
+
+🛡 Security Guardrails & Artifact Management
+Local Scope Enforcement: Every tool command generated by the LLM passes through python3 ~/artifactory/sec_flow.py "<command>". If the command targets an IP or domain outside .blackboard/scope.json, it is blocked locally before hitting the network.
+
+Log Offloading: Large scanner outputs (e.g., ffuf, nmap, httpx) are captured under .blackboard/artifacts/raw_output_<id>.log. Only summarized highlights and artifact pointers are returned to the conversation window, ensuring fast response times and clean context limits.
