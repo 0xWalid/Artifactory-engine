@@ -1,22 +1,22 @@
-Markdown
+```markdown
 # 🏴‍☠️ Artifactory Security Engine
 
-**Artifactory** is a practitioner-first, multi-agent security analysis engine built around a **Sovereign Blackboard Architecture**. Designed for AI-assisted penetration testing and bug hunting, it structures LLM execution into deterministic recon, dynamic playbook selection, and context-isolated tool execution.
+Artifactory is a practitioner-first, multi-agent security analysis engine built around a **Sovereign Blackboard Architecture**. Designed for AI-assisted security testing, it structures execution into deterministic recon, dynamic playbook selection, and context-isolated tool execution.
 
-Instead of throwing unconstrained CLI outputs directly into LLM context windows or letting AI run loose on production infrastructure, Artifactory uses local execution safety wrappers, strict scope enforcement, and pointer-based log management.
+Instead of throwing unconstrained CLI outputs directly into LLM context windows or running without scope constraints, Artifactory uses local execution safety wrappers, strict scope enforcement, and pointer-based log management.
 
 ---
 
 ## 💡 Why Artifactory? (The Architecture Edge)
 
-Most AI security tools fail in real-world engagements because they either overload the LLM context window with thousands of lines of terminal output or lack strict guardrails, leading to out-of-scope testing. Artifactory solves this with four core principles:
+Artifactory addresses common friction points in automated security workflows through structured local execution:
 
 | Architectural Feature | Traditional AI Wrapper | Artifactory Engine |
 | :--- | :--- | :--- |
-| **Scope Safety** | Relies on system prompts (fails under jailbreaks) | Hard-gated local checks (`sec_flow.py`) against `scope.json` before any command runs. |
-| **Context Management** | Dumps raw stdout/stderr straight into context | Saves raw CLI logs to `.blackboard/artifacts/` and feeds lightweight pointer IDs (`[MSG_XXXX]`) to the LLM. |
-| **Playbook Mechanics** | Generates unverified, hallucinated commands | Executes pre-tested markdown tradecraft playbooks from `prompts/` via `playbook_engine.py`. |
-| **Multi-Agent Flow** | Single monolithic prompt loop | Blackboard pattern: Specialized sub-agents share a unified local state file (`board.json`). |
+| **Scope Safety** | Relies solely on system prompts | Hard-gated local checks (`sec_flow.py`) against `scope.json` before commands execute. |
+| **Context Management** | Dumps raw stdout/stderr into context | Saves raw CLI logs to `.blackboard/artifacts/` and references lightweight pointer IDs (`[MSG_XXXX]`). |
+| **Playbook Mechanics** | Generates unverified, dynamic commands | Executes pre-tested markdown tradecraft playbooks from `prompts/` via `playbook_engine.py`. |
+| **Multi-Agent Flow** | Single monolithic prompt loop | Shared local blackboard state file (`board.json`) across specialized agent tasks. |
 
 ---
 
@@ -33,64 +33,79 @@ artifactory-engine/
     │   ├── scope.json
     │   ├── board.json
     │   └── artifacts/          <-- Raw execution logs
-    └── prompts/                <-- Specialized Playbook Libraries
-        ├── web/                <-- Web app tradecraft (IDOR, Smuggling, XSS)
-        ├── api/                <-- REST, GraphQL, gRPC playbooks
-        ├── cloud/              <-- AWS, Azure, IAM misconfiguration vectors
-        └── network/            <-- Service enumeration, port vectors
-```
-🚀 One-Command Automated Installation
-Artifactory installs itself automatically and registers directly into OpenCode as a slash command (/artifactory).
+    └── prompts/                <-- Playbook Libraries
+        ├── web/                <-- Web app testing procedures
+        ├── api/                <-- API testing playbooks
+        ├── cloud/              <-- Cloud configuration checks
+        └── network/            <-- Network enumeration guides
 
-Bash
+```
+
+---
+
+## 🚀 Automated Installation
+
+Artifactory includes an automated installer script that configures local directories and integration paths.
+
+```bash
 git clone [https://github.com/YOUR_USERNAME/artifactory-engine.git](https://github.com/YOUR_USERNAME/artifactory-engine.git)
 cd artifactory-engine
 ./install.sh
-What install.sh Does Automatically:
-Links ~/artifactory directly to artifactory-engine/artifactory for unified paths.
 
-Initializes local storage directories (.blackboard/artifacts/).
+```
 
-Makes wrapper scripts (sec_flow.py, playbook_engine.py) executable.
+### Setup Tasks Executed by `install.sh`:
 
-Registers /artifactory in ~/.config/opencode/commands/artifactory.md.
+1. Creates a symlink from `~/artifactory` to `artifactory-engine/artifactory` for path consistency.
+2. Initializes local storage directories (`.blackboard/artifacts/`).
+3. Sets execution permissions for wrapper scripts (`sec_flow.py`, `playbook_engine.py`).
+4. Configures command definition files in `~/.config/opencode/commands/artifactory.md`.
 
-🛠 Target Workflows & Use Cases
-1. Autonomous Attack Surface Recon & Priority Mapping
-Scenario: Starting a new engagement or bug bounty target with zero prior context.
+---
 
-Command:
+## 🛠 Workflows & Integration
 
-Plaintext
-/artifactory analyze target.com
-Execution Flow:
+### 1. Attack Surface Analysis Workflow
 
-Phase 0 (Scope Prompt): The engine pauses and explicitly asks for in-scope assets, out-of-scope rules, rate limits, and custom auth headers. Updates .blackboard/scope.json.
+Used to define boundaries, map assets, and prioritize evaluation areas.
 
-Phase 1 (Reconnaissance): sec_flow.py runs passive asset enumeration, DNS mapping, and HTTP probing.
+```text
+/artifactory analyze example.com
 
-Phase 2 (Priority Matrix): Evaluates subdomains, unusual ports, and technology stacks to surface high-yield business logic targets.
+```
 
-Phase 3 (Playbook Execution): Loads corresponding playbooks from prompts/ to test identified surfaces.
+**Execution Flow:**
 
-2. Urgent / Targeted Single-Vector Testing
-Scenario: You suspect a specific high-severity vulnerability (e.g., HTTP Request Smuggling, GraphQL introspection, or AWS S3 takeover) and want immediate, structured testing.
+1. **Scope Verification:** Prompts for explicitly allowed domains, excluded targets, rate limits, and authentication details. Updates `.blackboard/scope.json`.
+2. **Reconnaissance:** Executes passive asset enumeration and HTTP probing via `sec_flow.py`.
+3. **Priority Assessment:** Categorizes endpoints, unusual ports, and technology stacks to build an evaluation queue.
+4. **Playbook Execution:** References corresponding documentation in `prompts/` for target testing.
 
-Command:
+---
 
-Plaintext
-/artifactory test target.com for HTTP Request Smuggling urgently
-Execution Flow:
+### 2. Direct Vector Testing Workflow
 
-Confirms target.com against .blackboard/scope.json.
+Used for targeted evaluation of specific vulnerability classes or configurations.
 
-Bypasses broad discovery and queries playbook_engine.py for matching playbooks in prompts/web/.
+```text
+/artifactory test example.com for HTTP Request Smuggling
 
-If a playbook exists, it executes step-by-step verification commands.
+```
 
-If no playbook exists, it prompts the practitioner to define tradecraft, converts it into a markdown playbook, and saves it for future runs.
+**Execution Flow:**
 
-🛡 Security Guardrails & Artifact Management
-Local Scope Enforcement: Every tool command generated by the LLM passes through python3 ~/artifactory/sec_flow.py "<command>". If the command targets an IP or domain outside .blackboard/scope.json, it is blocked locally before hitting the network.
+1. Verifies target host boundaries against `.blackboard/scope.json`.
+2. Queries `playbook_engine.py` for matching playbooks in `prompts/web/`.
+3. Sequentially executes verified test steps defined in the playbook.
+4. Saves raw output to `.blackboard/artifacts/` and updates `.blackboard/board.json`.
 
-Log Offloading: Large scanner outputs (e.g., ffuf, nmap, httpx) are captured under .blackboard/artifacts/raw_output_<id>.log. Only summarized highlights and artifact pointers are returned to the conversation window, ensuring fast response times and clean context limits.
+---
+
+## 🛡 Guardrails & Log Management
+
+* **Local Scope Enforcement:** Commands are parsed by `python3 ~/artifactory/sec_flow.py "<command>"` before execution. Target domains and IP addresses are validated against `.blackboard/scope.json`.
+* **Log Offloading:** Tool output is captured under `.blackboard/artifacts/raw_output_<id>.log`. Summaries and pointer IDs are returned to the session context to maintain efficient context limits.
+
+```
+
+```
