@@ -1,4 +1,4 @@
-```markdown
+
 # 🏴‍☠️ Artifactory Security Engine
 
 Artifactory is a practitioner-first, multi-agent security analysis engine built around a **Sovereign Blackboard Architecture**. Designed for AI-assisted security testing, it structures execution into deterministic recon, dynamic playbook selection, and context-isolated tool execution.
@@ -48,7 +48,7 @@ artifactory-engine/
 Artifactory includes an automated installer script that configures local directories and integration paths.
 
 ```bash
-git clone [https://github.com/0xWalid/artifactory-engine.git](https://github.com/0xWalid/artifactory-engine.git)
+git clone https://github.com/0xWalid/artifactory-engine.git
 cd artifactory-engine
 ./install.sh
 
@@ -71,7 +71,6 @@ Used to define boundaries, map assets, and prioritize evaluation areas.
 
 ```text
 /artifactory analyze example.com
-
 ```
 
 **Execution Flow:**
@@ -89,7 +88,6 @@ Used for targeted evaluation of specific vulnerability classes or configurations
 
 ```text
 /artifactory test example.com for HTTP Request Smuggling
-
 ```
 
 **Execution Flow:**
