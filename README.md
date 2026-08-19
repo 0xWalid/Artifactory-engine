@@ -48,7 +48,7 @@ artifactory-engine/
 Artifactory includes an automated installer script that configures local directories and integration paths.
 
 ```bash
-git clone [https://github.com/YOUR_USERNAME/artifactory-engine.git](https://github.com/YOUR_USERNAME/artifactory-engine.git)
+git clone [https://github.com/0xWalid/artifactory-engine.git](https://github.com/0xWalid/artifactory-engine.git)
 cd artifactory-engine
 ./install.sh
 
@@ -106,6 +106,3 @@ Used for targeted evaluation of specific vulnerability classes or configurations
 * **Local Scope Enforcement:** Commands are parsed by `python3 ~/artifactory/sec_flow.py "<command>"` before execution. Target domains and IP addresses are validated against `.blackboard/scope.json`.
 * **Log Offloading:** Tool output is captured under `.blackboard/artifacts/raw_output_<id>.log`. Summaries and pointer IDs are returned to the session context to maintain efficient context limits.
 
-```
-
-```
