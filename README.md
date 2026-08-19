@@ -38,6 +38,7 @@ artifactory-engine/
         ├── api/                <-- REST, GraphQL, gRPC playbooks
         ├── cloud/              <-- AWS, Azure, IAM misconfiguration vectors
         └── network/            <-- Service enumeration, port vectors
+```
 🚀 One-Command Automated Installation
 Artifactory installs itself automatically and registers directly into OpenCode as a slash command (/artifactory).
 
