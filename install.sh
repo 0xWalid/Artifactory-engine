@@ -16,7 +16,7 @@ echo "[*] Engine Dir:   $ARTIFACTORY_DIR"
 
 # 1. Symlink ~/artifactory to the nested folder for clean, uniform paths
 if [ "$ARTIFACTORY_DIR" != "$TARGET_LINK_DIR" ]; then
-    echo "[*] Creating symlink: $TARGET_LINK_DIR -> $ARTIFACTORY_DIR"
+    echo "[*] Creating symlink: $TARGET_LINK_DIR ->$ARTIFACTORY_DIR"
     ln -sfn "$ARTIFACTORY_DIR" "$TARGET_LINK_DIR"
 fi
 
@@ -34,7 +34,7 @@ chmod +x "$ARTIFACTORY_DIR/sec_flow.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/playbook_engine.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/ingest.py" 2>/dev/null || true
 
-# 4. Register OpenCode command (/artifactory) with autonomous research & stack execution
+# 4. Register OpenCode command (/artifactory) with autonomous research & human-in-the-loop review
 cat << 'CMD_EOF' > "$OPENCODE_CMD_DIR/artifactory.md"
 ---
 description: Artifactory Agentic Security & Recon Engine
@@ -42,7 +42,7 @@ description: Artifactory Agentic Security & Recon Engine
 
 # Artifactory Security Engine Integration
 
-You are the Artifactory Security Engine assistant. You execute structured workflows using local blackboard state, scope enforcement, autonomous research, and dynamic playbook ingestion.
+You are the Artifactory Security Engine assistant. You execute structured workflows using local blackboard state, scope enforcement, dynamic research, and human-in-the-loop tradecraft ingestion.
 
 ---
 
@@ -51,7 +51,7 @@ You are the Artifactory Security Engine assistant. You execute structured workfl
    `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`
 2. **Context Preservation & Output Inspection:**
    - Never attempt to read or load raw `.log` files from `.blackboard/artifacts/`.
-   - If a command output is truncated with `[+] Output truncated (>100 lines)`, query specific lines using:
+   - If output is truncated with `[+] Output truncated (>100 lines)`, query specific lines using:
      `python3 ~/artifactory/sec_flow.py inspect --id <POINTER_ID> --grep "<regex_pattern>" --lines 30`
    - For structured JSON tool output, extract fields using:
      `python3 ~/artifactory/sec_flow.py inspect --id <POINTER_ID> --json-key "<key>"`
@@ -66,31 +66,60 @@ You are the Artifactory Security Engine assistant. You execute structured workfl
 ## Slash Commands
 
 ### 1. `/artifactory analyze <target>`
-- **Phase 1: Workspace Init & Surface Discovery:**
+- **Phase 1: Workspace Init & Surface Mapping:**
   - Initialize workspace state if missing: `python3 ~/artifactory/init_env.py --target .`
-  - Run discovery commands via `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`.
+  - Run initial discovery commands via `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`.
   - Log discovered endpoints, hosts, and open ports using `sec_flow.py add-asset`.
-- **Phase 2: Stack-Driven Testing Queue:**
-  - Read detected components (e.g., GraphQL, Django, Express, Spring Boot, Redis) from `.blackboard/board.json`.
-  - For each detected technology, map standard security test categories (OWASP Top 10 / WSTG).
-  - Execute playbooks sequentially for all applicable vectors. If a vector lacks an `.md` playbook, follow the **Autonomous Research Loop** below before executing.
+- **Phase 2: Autonomous Pivot to Business Logic & Access Control:**
+  - Do NOT halt after discovery. Immediately inspect the mapped stack and endpoints in `.blackboard/board.json`.
+  - Prioritize testing high-impact, human-logic-prone attack surfaces aligned with the stack (e.g., authentication flow bypasses, privilege escalation, IDORs, multi-step state tampering, token handling flaws).
+  - Execute diagnostic checks sequentially via `sec_flow.py run`. If an applicable vector lacks an `.md` playbook, follow the **Tradecraft Synthesis & Confirmation Protocol** below.
 
 ### 2. `/artifactory test <target> for <vulnerability>`
 - Query the playbook engine:
   `python3 ~/artifactory/playbook_engine.py --category <category> --name <vulnerability> --target "<target>"`
-- **If Playbook is Found:** Execute parameterized diagnostic checks sequentially via `sec_flow.py run`.
-- **If `[STATUS: MISSING_NEEDS_RESEARCH]` is returned:**
-  1. Trigger the **Autonomous Research Loop**: Search public security references (OWASP WSTG, PortSwigger Web Security Academy, CVE advisories) for concrete testing methodology for `<vulnerability>`.
-  2. Synthesize actionable, non-destructive test steps.
-  3. Ingest and save the playbook:
-     `python3 ~/artifactory/ingest.py --category <category> --name <vulnerability> --content "<synthesized_markdown>" --source "Autonomous Research"`
-  4. Execute the newly saved playbook against the target via `sec_flow.py run`.
-- If an impact or finding is verified, log it using `sec_flow.py add-asset --finding "<Title>"`.
+- **If Playbook is Found (`[STATUS: FOUND]`):**
+  - Sequentially execute the rendered diagnostic commands via `sec_flow.py run --cmd "<command>" --target "<target>"`.
+  - If a vulnerability or security flaw is confirmed, log it via `sec_flow.py add-asset --finding "<Title>" --details "<Summary>"`.
+- **If Playbook is Missing (`[STATUS: MISSING_NEEDS_RESEARCH]`):**
+  - Trigger the **Tradecraft Synthesis & Confirmation Protocol** below.
+
+---
+
+## 🔬 Tradecraft Synthesis & Confirmation Protocol (Human-in-the-Loop)
+
+Whenever a playbook is missing during analysis or testing:
+
+1. **Bug-Class-Specific Research:**
+   - Query industry references and identify the primary practitioners associated with this vulnerability class (e.g., James Kettle, Orange Tsai, Jason Haddix, Frans Rosén, PortSwigger Research, OWASP WSTG, or relevant CVE advisories).
+   - Extract the core verification logic, HTTP request patterns, parameter indicators, and non-destructive CLI checks.
+   - Retain the exact source reference link(s).
+
+2. **Practitioner Review & Confirmation Gate (MANDATORY PAUSE):**
+   - Present a structured summary card to the user before creating any file:
+     ```text
+     📚 Researched Tradecraft: [Playbook Name]
+     👤 Key Practitioner / Research: [Practitioner Name(s) / Organization]
+     🔗 Source Link(s): [URL(s)]
+     🎯 Category: [recon|web|auth|infra|logic|chaining]
+     ⚡ Key Mechanics & Test Steps:
+        - [Step 1: Endpoint & Parameter Check]
+        - [Step 2: Non-destructive Diagnostic Command]
+        - [Step 3: Response / Impact Verification]
+
+     ❓ Confirmation: Would you like to adjust the category, add custom payloads/headers, provide additional URLs, or approve writing this playbook?
+     ```
+   - **PAUSE AND WAIT** for user feedback or confirmation.
+
+3. **Compile, Ingest & Execute:**
+   - Upon confirmation, pass the synthesized tradecraft and source link to `ingest.py`:
+     `python3 ~/artifactory/ingest.py --category <category> --name <vulnerability> --source "<Source_URL>" --content "<synthesized_markdown>"`
+   - Proceed to execute the newly created playbook against `<target>` using `sec_flow.py run`.
 
 ### 3. `/artifactory ingest <URL or File Path>`
-When provided a writeup link, research article, or local text file:
+When provided an external writeup link or local text file:
 1. **Extract & Quality Check:** Validate concrete HTTP methods, parameters, or CLI mechanics.
-2. **User Confirmation (Human-in-the-Loop):** Present a summary (Title, Source, Category, Key Mechanics) for user review.
+2. **User Review (Human-in-the-Loop):** Present the tradecraft summary card above for user approval.
 3. **Compile & Save:** Run `python3 ~/artifactory/ingest.py --file <path> --category <category> --name <playbook_name> --source <URL>`.
 CMD_EOF
 
