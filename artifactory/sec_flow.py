@@ -1,155 +1,269 @@
 #!/usr/bin/env python3
 """
-Sovereign Blackboard Architecture - Execution Wrapper & Guardrails (Phase 4)
-Handles deterministic tool execution, scope tripwires, SAST pre-filtering, 
-and artifact pointer management.
+Sovereign Blackboard Architecture - Security Flow Execution Engine
+Handles safe non-shell execution, CIDR scope validation, artifact logging,
+JSON-aware inspection, and state asset recording.
 """
 
 import argparse
+import ipaddress
 import json
-import os
 import re
+import shlex
+import socket
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 BLACKBOARD_DIR = Path.cwd() / ".blackboard"
 ARTIFACTS_DIR = BLACKBOARD_DIR / "artifacts"
+HISTORY_FILE = BLACKBOARD_DIR / "history.log"
 SCOPE_FILE = BLACKBOARD_DIR / "scope.json"
 BOARD_FILE = BLACKBOARD_DIR / "board.json"
 
-# Ensure runtime directories exist
-ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def ensure_blackboard_dirs():
+    BLACKBOARD_DIR.mkdir(parents=True, exist_ok=True)
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not HISTORY_FILE.exists():
+        HISTORY_FILE.touch()
 
 
-def load_scope():
-    """Loads scope constraints from .blackboard/scope.json"""
-    if not SCOPE_FILE.exists():
-        print("[!] Warning: No scope.json found. Creating default empty scope.")
-        default_scope = {"allowed_domains": [], "allowed_ips": [], "canary_tokens": ["CANARY_TRIPWIRE_TOKEN"]}
-        SCOPE_FILE.write_text(json.dumps(default_scope, indent=2))
-        return default_scope
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
     try:
-        return json.loads(SCOPE_FILE.read_text())
-    except Exception as e:
-        print(f"[!] Error parsing scope.json: {e}")
-        sys.exit(1)
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
 
 
-def check_scope_and_canaries(target: str) -> bool:
-    """Tripwire check: Verify target matches scope and doesn't hit a canary token."""
-    scope = load_scope()
-    
-    # Check Canary Tokens
-    for token in scope.get("canary_tokens", []):
-        if token in target:
-            print(f"[TRIPWIRE TRIGGERED] Target string contains Canary token '{token}'. Aborting execution immediately.")
-            return False
-
-    allowed_domains = scope.get("allowed_domains", [])
-    allowed_ips = scope.get("allowed_ips", [])
-
-    # If no restrictions are set, log a warning
-    if not allowed_domains and not allowed_ips:
-        print("[!] Notice: Allowed scope lists are empty. Proceeding with caution.")
+def is_target_in_scope(target: str, scope: dict) -> bool:
+    if not scope:
         return True
 
-    # Simple domain matching
-    domain_match = any(domain in target for domain in allowed_domains)
-    ip_match = any(ip in target for ip in allowed_ips)
+    allowed_hosts = scope.get("allowed_hosts", [])
+    allowed_domains = scope.get("allowed_domains", [])
+    allowed_cidrs = scope.get("allowed_cidrs", [])
 
-    if not (domain_match or ip_match):
-        print(f"[SCOPE DENIED] Target '{target}' does not match allowed domains/IPs in scope.json.")
-        return False
+    clean_target = target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
 
-    return True
+    # Host & Domain checks
+    if clean_target in allowed_hosts:
+        return True
 
+    for domain in allowed_domains:
+        domain_clean = domain.replace("*.", "")
+        if clean_target == domain_clean or clean_target.endswith("." + domain_clean):
+            return True
 
-def run_sast_prefilter(target_path: str, rule_config: str = "auto") -> dict:
-    """Runs deterministic SAST (Semgrep) pre-filtering on a target code directory or file."""
-    print(f"[*] Running SAST pre-filter on: {target_path}")
-    if not os.path.exists(target_path):
-        return {"status": "error", "message": f"Path {target_path} does not exist"}
-
-    cmd = ["semgrep", "--config", rule_config, "--json", target_path]
+    # IP & CIDR Subnet checks
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if res.returncode in (0, 1): # 0 = no findings, 1 = findings
-            try:
-                data = json.loads(res.stdout)
-                return {"status": "success", "results": data.get("results", [])}
-            except json.JSONDecodeError:
-                return {"status": "error", "message": "Failed to parse Semgrep output JSON"}
-        return {"status": "error", "message": res.stderr}
-    except FileNotFoundError:
-        print("[!] Semgrep is not installed or not in PATH. Skipping SAST pre-filtering.")
-        return {"status": "skipped", "message": "Semgrep binary missing"}
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "message": "SAST pre-filter timed out after 120s"}
+        resolved_ip_str = socket.gethostbyname(clean_target)
+        if resolved_ip_str in allowed_hosts:
+            return True
+
+        resolved_ip = ipaddress.ip_address(resolved_ip_str)
+        for cidr in allowed_cidrs:
+            if resolved_ip in ipaddress.ip_network(cidr, strict=False):
+                return True
+    except (socket.gaierror, ValueError):
+        pass
+
+    return False
 
 
-def execute_tool(cmd_str: str, target_ref: str) -> str:
-    """Executes a command safely, enforcing tripwires and saving output as a pointer artifact."""
-    if not check_scope_and_canaries(target_ref):
+def update_board_state(pointer_id: str, cmd: str, returncode: int, summary: str = ""):
+    if not BOARD_FILE.exists():
+        return
+
+    try:
+        board_data = load_json(BOARD_FILE)
+        board_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        
+        pointer_entry = {
+            "pointer_id": pointer_id,
+            "command": cmd,
+            "return_code": returncode,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "summary": summary
+        }
+        
+        board_data.setdefault("execution_log_pointers", []).append(pointer_entry)
+        BOARD_FILE.write_text(json.dumps(board_data, indent=2))
+    except Exception as e:
+        print(f"[!] Warning: Could not update board.json: {e}", file=sys.stderr)
+
+
+def add_asset_to_board(host: str = None, endpoint: str = None, port: str = None, finding: str = None, details: str = ""):
+    if not BOARD_FILE.exists():
+        print(f"[!] Error: {BOARD_FILE} not found. Run init_env.py first.", file=sys.stderr)
         sys.exit(1)
 
-    artifact_id = f"MSG_{uuid.uuid4().hex[:8].upper()}"
-    output_file = ARTIFACTS_DIR / f"{artifact_id}.log"
+    try:
+        board_data = load_json(BOARD_FILE)
+        board_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        
+        assets = board_data.setdefault("discovered_assets", {"hosts": [], "endpoints": [], "open_ports": []})
+        findings_list = board_data.setdefault("findings", [])
 
-    print(f"[*] Executing Tool Command: {cmd_str}")
-    print(f"[*] Artifact Pointer ID: {artifact_id}")
+        added = []
+        if host and host not in assets.setdefault("hosts", []):
+            assets["hosts"].append(host)
+            added.append(f"Host: {host}")
+
+        if endpoint and endpoint not in assets.setdefault("endpoints", []):
+            assets["endpoints"].append(endpoint)
+            added.append(f"Endpoint: {endpoint}")
+
+        if port and port not in assets.setdefault("open_ports", []):
+            assets["open_ports"].append(port)
+            added.append(f"Port: {port}")
+
+        if finding:
+            entry = {
+                "id": f"FINDING_{uuid.uuid4().hex[:6].upper()}",
+                "title": finding,
+                "details": details,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            findings_list.append(entry)
+            added.append(f"Finding: {finding}")
+
+        BOARD_FILE.write_text(json.dumps(board_data, indent=2))
+        print(f"[✔] Blackboard updated: {', '.join(added) if added else 'No new entries'}")
+
+    except Exception as e:
+        print(f"[!] Error updating assets in board.json: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def run_command(cmd: str, target: str = None):
+    ensure_blackboard_dirs()
+    scope = load_json(SCOPE_FILE)
+
+    if target and not is_target_in_scope(target, scope):
+        print(f"[!] SCOPE ERROR: Target '{target}' is not permitted by .blackboard/scope.json", file=sys.stderr)
+        sys.exit(1)
+
+    pointer_id = f"MSG_{uuid.uuid4().hex[:8].upper()}"
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    print(f"[*] Executing [{pointer_id}]: {cmd}")
 
     try:
-        res = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=300)
-        full_output = f"=== STDOUT ===\n{res.stdout}\n\n=== STDERR ===\n{res.stderr}"
-        output_file.write_text(full_output)
-
-        # Truncated context output
-        stdout_lines = res.stdout.splitlines()
-        preview = "\n".join(stdout_lines[:15]) if len(stdout_lines) > 15 else res.stdout
-        
-        summary = (
-            f"Command Executed: {cmd_str}\n"
-            f"Exit Code: {res.returncode}\n"
-            f"Artifact Saved: {output_file}\n"
-            f"Pointer ID: [{artifact_id}]\n"
-            f"--- Output Preview (First 15 lines) ---\n"
-            f"{preview}\n"
-            f"--- End Preview (Use artifact {artifact_id} for full raw data) ---"
-        )
-        return summary
-    except subprocess.TimeoutExpired:
-        error_msg = f"Command timed out: {cmd_str}"
-        output_file.write_text(error_msg)
-        return f"[!] Error: Execution timed out. Artifact saved to [{artifact_id}]."
+        cmd_args = shlex.split(cmd)
+        result = subprocess.run(cmd_args, shell=False, capture_output=True, text=True)
+        stdout, stderr = result.stdout, result.stderr
+        returncode = result.returncode
     except Exception as e:
-        error_msg = f"Execution failed: {str(e)}"
-        output_file.write_text(error_msg)
-        return f"[!] Error executing command: {str(e)}"
+        stdout, stderr = "", str(e)
+        returncode = 1
+
+    artifact_path = ARTIFACTS_DIR / f"{pointer_id}.log"
+    artifact_content = f"--- COMMAND ---\n{cmd}\n\n--- STDOUT ---\n{stdout}\n\n--- STDERR ---\n{stderr}\n"
+    artifact_path.write_text(artifact_content)
+
+    with open(HISTORY_FILE, "a") as f:
+        f.write(f"[{timestamp}] [{pointer_id}] RETURN:{returncode} CMD: {cmd}\n")
+
+    lines = stdout.strip().split("\n") if stdout else []
+    summary = lines[0] if lines else ("Error" if stderr else "Empty Output")
+    update_board_state(pointer_id, cmd, returncode, summary[:120])
+
+    if len(lines) > 100:
+        print(f"[+] Output truncated (>100 lines). Full log: .blackboard/artifacts/{pointer_id}.log")
+        print("\n".join(lines[:20]))
+        print(f"\n... [{len(lines) - 40} lines omitted] ...\n")
+        print("\n".join(lines[-20:]))
+    else:
+        if stdout:
+            print(stdout)
+
+    if stderr:
+        print(stderr, file=sys.stderr)
+
+
+def inspect_artifact(pointer_id: str, grep_pattern: str = None, json_key: str = None, max_lines: int = 50):
+    artifact_path = ARTIFACTS_DIR / f"{pointer_id}.log"
+
+    if not artifact_path.exists():
+        print(f"[!] Error: Artifact '{pointer_id}' not found in {ARTIFACTS_DIR}", file=sys.stderr)
+        sys.exit(1)
+
+    raw_text = artifact_path.read_text()
+
+    # Extract STDOUT section only
+    stdout_match = re.search(r"--- STDOUT ---\n(.*?)(?=\n--- STDERR ---|\Z)", raw_text, re.DOTALL)
+    stdout_content = stdout_match.group(1).strip() if stdout_match else raw_text
+
+    # Mode 1: JSON Key Extractor
+    if json_key:
+        print(f"[*] Extracting JSON key '{json_key}' from {pointer_id}:")
+        found = False
+        for line in stdout_content.splitlines():
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict) and json_key in data:
+                    print(json.dumps(data[json_key], indent=2))
+                    found = True
+            except json.JSONDecodeError:
+                continue
+        if not found:
+            print(f"[!] Key '{json_key}' not found or output is not line-delimited JSON.")
+        return
+
+    # Mode 2: Regex Grep
+    lines = stdout_content.splitlines()
+    if grep_pattern:
+        regex = re.compile(grep_pattern, re.IGNORECASE)
+        matched_lines = [line for line in lines if regex.search(line)]
+        print(f"[*] Showing matches for '{grep_pattern}' in {pointer_id} (Limit: {max_lines}):\n")
+        for line in matched_lines[:max_lines]:
+            print(line)
+        if len(matched_lines) > max_lines:
+            print(f"\n... [{len(matched_lines) - max_lines} matching lines omitted] ...")
+        return
+
+    # Mode 3: Head slice
+    print(f"[*] Showing head of {pointer_id} (Limit: {max_lines}):\n")
+    for line in lines[:max_lines]:
+        print(line)
+    if len(lines) > max_lines:
+        print(f"\n... [{len(lines) - max_lines} lines omitted] ...")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Sovereign Blackboard Tool Execution Wrapper")
-    subparsers = parser.add_subparsers(dest="action", help="Action to perform")
+    parser = argparse.ArgumentParser(description="Security Flow Execution Engine")
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
-    # Run tool sub-command
-    run_parser = subparsers.add_parser("run", help="Run a security tool command")
-    run_parser.add_argument("--cmd", required=True, help="Command string to execute")
-    run_parser.add_argument("--target", required=True, help="Target domain/IP/path to validate scope")
+    # run
+    run_parser = subparsers.add_parser("run", help="Run command and log artifacts")
+    run_parser.add_argument("--cmd", required=True, help="Command to execute")
+    run_parser.add_argument("--target", help="Target domain/host to validate against scope")
 
-    # SAST sub-command
-    sast_parser = subparsers.add_parser("sast", help="Run SAST pre-filtering on source code")
-    sast_parser.add_argument("--path", required=True, help="Path to source directory or file")
-    sast_parser.add_argument("--rules", default="auto", help="Semgrep rulesets or config")
+    # inspect
+    inspect_parser = subparsers.add_parser("inspect", help="Inspect and query artifact logs")
+    inspect_parser.add_argument("--id", required=True, help="Pointer ID (e.g., MSG_A1B2C3D4)")
+    inspect_parser.add_argument("--grep", help="Regex pattern to filter log lines")
+    inspect_parser.add_argument("--json-key", help="JSON field/key to extract from output lines")
+    inspect_parser.add_argument("--lines", type=int, default=50, help="Max lines to return (default: 50)")
+
+    # add-asset
+    asset_parser = subparsers.add_parser("add-asset", help="Record discovered asset to board.json")
+    asset_parser.add_argument("--host", help="Discovered hostname or IP")
+    asset_parser.add_argument("--endpoint", help="Discovered URL path or route")
+    asset_parser.add_argument("--port", help="Discovered open port (e.g., 8080/tcp)")
+    asset_parser.add_argument("--finding", help="Vulnerability or observation title")
+    asset_parser.add_argument("--details", default="", help="Short description of the finding")
 
     args = parser.parse_args()
 
-    if args.action == "run":
-        result = execute_tool(args.cmd, args.target)
-        print(result)
-    elif args.action == "sast":
-        result = run_sast_prefilter(args.path, args.rules)
-        print(json.dumps(result, indent=2))
-    else:
-        parser.print_help()
+    if args.subcommand == "run":
+        run_command(args.cmd, args.target)
+    elif args.subcommand == "inspect":
+        inspect_artifact(args.id, args.grep, args.json_key, args.lines)
+    elif args.subcommand == "add-asset":
+        add_asset_to_board(args.host, args.endpoint, args.port, args.finding, args.details)

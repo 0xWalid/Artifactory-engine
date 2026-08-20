@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Sovereign Blackboard Architecture - On-Demand Playbook Engine
-Checks for existing micro-playbooks or generates practitioner templates.
+Checks, generates, and renders practitioner playbooks with target parameter substitution.
 """
 
 import argparse
@@ -18,48 +18,74 @@ def get_playbook_path(category: str, name: str) -> Path:
     return PROMPTS_DIR / category / slug
 
 
-def check_or_create_playbook(category: str, name: str, author: str = "Practitioner"):
+def render_playbook(content: str, target: str = "", auth_token: str = "") -> str:
+    """Substitutes template variables with active engagement targets."""
+    if not target:
+        return content
+
+    target_host = target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+    target_url = target if target.startswith("http") else f"https://{target}"
+
+    rendered = content.replace("{{TARGET_HOST}}", target_host)
+    rendered = rendered.replace("{{TARGET_URL}}", target_url)
+
+    if auth_token:
+        rendered = rendered.replace("{{AUTH_TOKEN}}", auth_token)
+
+    return rendered
+
+
+def check_or_create_playbook(category: str, name: str, author: str = "Practitioner", target: str = "", auth_token: str = ""):
     target_path = get_playbook_path(category, name)
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
     if target_path.exists():
-        print(f"[FOUND] Playbook exists at: {target_path}")
-        return target_path, target_path.read_text(), False
+        raw_content = target_path.read_text()
+        rendered_content = render_playbook(raw_content, target, auth_token)
+        return target_path, rendered_content, False
 
-    # Template structure if missing
-    template = f"""# Micro-Playbook: {name}
+    # Standard starter template
+    template = f"""# Micro-Playbook: {name.replace('_', ' ').title()}
 **Practitioner / Methodology:** {author}
 **Category:** {category}
 
 ## 1. Objective
-Describe the target vulnerability or tradecraft scenario.
+Describe the target scenario or vector.
 
 ## 2. Methodology & Step-by-Step Tradecraft
-1. **Initial Vector:** Identify relevant endpoints and headers.
-2. **Probing & Payload Testing:** Describe non-destructive test cases.
-3. **Verification:** Confirm impact without causing system disruption.
+1. **Initial Vector:** Identify relevant endpoints and headers on `{{{{TARGET_URL}}}}`.
+2. **Probing & Diagnostic Testing:** Non-destructive test commands.
+3. **Verification:** Confirm status without disrupting operations.
 
-## 3. Agent Operational Constraints
-- Store raw tool outputs / HTTP dumps in `.blackboard/artifacts/` via `sec_flow.py`.
-- Never output logs >100 lines into context; reference via pointer IDs (`[MSG_XXX]`).
+## 3. Operational Constraints
+- Execute all commands via `sec_flow.py run --cmd "<command>" --target "{{{{TARGET_HOST}}}}"`.
+- Query large outputs via `sec_flow.py inspect --id <POINTER_ID>`.
 """
-    return target_path, template, True
+    target_path.write_text(template)
+    rendered_template = render_playbook(template, target, auth_token)
+    return target_path, rendered_template, True
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="On-Demand Playbook Engine")
     parser.add_argument("--category", "-c", required=True, choices=["recon", "web", "auth", "infra", "logic", "chaining"])
-    parser.add_argument("--name", "-n", required=True, help="Playbook name (e.g., http_smuggling)")
-    parser.add_argument("--author", "-a", default="Industry Specialist", help="Author/Practitioner reference (e.g., James Kettle)")
-    
+    parser.add_argument("--name", "-n", required=True, help="Playbook name (e.g., graphql_idor)")
+    parser.add_argument("--author", "-a", default="Practitioner", help="Author/Practitioner reference")
+    parser.add_argument("--target", "-t", default="", help="Target URL/Host for dynamic variable substitution")
+    parser.add_argument("--auth-token", default="", help="Optional Bearer token for variable substitution")
+
     args = parser.parse_args()
-    path, content, is_new = check_or_create_playbook(args.category, args.name, args.author)
+    path, content, is_new = check_or_create_playbook(
+        category=args.category,
+        name=args.name,
+        author=args.author,
+        target=args.target,
+        auth_token=args.auth_token
+    )
 
     if is_new:
-        print(f"[MISSING] No playbook found. Creating initial template at: {path}")
-        path.write_text(content)
-        print("\n--- TEMPLATE GENERATED ---")
-        print(content)
+        print(f"[MISSING] Created initial template at: {path}\n")
     else:
-        print("\n--- EXISTING PLAYBOOK LOADED ---")
-        print(content)
+        print(f"[FOUND] Loaded playbook: {path}\n")
+
+    print(content)

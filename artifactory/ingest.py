@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""
+Sovereign Blackboard Architecture - Tradecraft Ingestion & Parameterization Pipeline
+Converts raw writeups, CTF solutions, and blog posts into generic, parameterized playbooks.
+"""
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+
+def strip_and_parameterize(raw_text: str, custom_target: str = None) -> str:
+    """
+    Strips specific domains, IPs, and hardcoded values from raw writeups,
+    replacing them with SBA template variables.
+    """
+    text = raw_text
+
+    if custom_target:
+        text = text.replace(custom_target, "{{TARGET_HOST}}")
+
+    # Replace specific IPs
+    text = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '{{TARGET_HOST}}', text)
+
+    # Replace common explicit protocols + domains
+    text = re.sub(r'https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?::\d+)?', '{{TARGET_URL}}', text)
+
+    # Replace standalone domain patterns (e.g., target.herokuapp.com)
+    text = re.sub(r'\b[a-zA-Z0-9.-]+\.(?:com|org|net|io|herokuapp\.com|local)\b', '{{TARGET_HOST}}', text)
+
+    # Convert generic authorization tokens/headers
+    text = re.sub(r'Bearer\s+[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*', 'Bearer {{AUTH_TOKEN}}', text)
+
+    return text
+
+
+def quality_gate_check(content: str) -> tuple[bool, str]:
+    """
+    Evaluates whether a writeup has enough actionable technical detail
+    to serve as a functional playbook.
+    """
+    has_cli = bool(re.search(r'(curl|ffuf|nmap|sqlmap|httpx|gobuster|nikto|semgrep|wfuzz)', content, re.I))
+    has_http_methods = bool(re.search(r'(GET|POST|PUT|DELETE|PATCH)\s+/', content))
+    has_parameters = bool(re.search(r'(\?|\&)[a-zA-Z0-9_]+=', content))
+
+    score = sum([has_cli, has_http_methods, has_parameters])
+
+    if score >= 1:
+        return True, f"Passed Quality Gate (Score: {score}/3 - Actionable technical mechanics identified)."
+    else:
+        return False, "Failed Quality Gate: Writeup lacks concrete CLI commands, HTTP methods, or parameter targets."
+
+
+def save_or_merge_playbook(category: str, name: str, content: str, source_ref: str = ""):
+    """Saves a new playbook or appends elevated strategy to an existing one."""
+    slug = name.lower().replace(" ", "_").replace("-", "_")
+    if not slug.endswith(".md"):
+        slug += ".md"
+
+    category_dir = PROMPTS_DIR / category
+    category_dir.mkdir(parents=True, exist_ok=True)
+    file_path = category_dir / slug
+
+    header = f"# Ingested Tradecraft: {name.replace('_', ' ').title()}\n"
+    if source_ref:
+        header += f"**Source Reference:** {source_ref}\n"
+    header += f"**Category:** {category}\n\n"
+
+    if file_path.exists():
+        print(f"[*] Updating existing playbook at: {file_path}")
+        with open(file_path, "a") as f:
+            f.write(f"\n\n---\n\n## 🔄 Elevated Strategy / Additional Vector\n")
+            if source_ref:
+                f.write(f"**Source:** {source_ref}\n\n")
+            f.write(content)
+    else:
+        print(f"[+] Creating new playbook at: {file_path}")
+        with open(file_path, "w") as f:
+            f.write(header + content)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Tradecraft Ingestion Engine")
+    parser.add_argument("--file", "-f", help="Path to raw writeup text file")
+    parser.add_argument("--category", "-c", required=True, choices=["recon", "web", "auth", "infra", "logic", "chaining"])
+    parser.add_argument("--name", "-n", required=True, help="Playbook target name (e.g., graphql_idor)")
+    parser.add_argument("--source", "-s", default="", help="Source reference URL or Article title")
+    parser.add_argument("--target-domain", "-t", default="", help="Specific target domain to strip out if known")
+
+    args = parser.parse_args()
+
+    if not args.file or not os.path.exists(args.file):
+        print("[!] Error: Valid --file path required.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(args.file, "r") as f:
+        raw_text = f.read()
+
+    passed, reason = quality_gate_check(raw_text)
+    print(f"[*] Quality Check: {reason}")
+
+    if not passed:
+        print("[!] Ingestion aborted. Input material is missing actionable execution steps.")
+        sys.exit(1)
+
+    parameterized_text = strip_and_parameterize(raw_text, args.target_domain)
+    save_or_merge_playbook(args.category, args.name, parameterized_text, args.source)
+    print("[✔] Ingestion complete.")
