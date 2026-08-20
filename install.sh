@@ -14,19 +14,25 @@ TARGET_LINK_DIR="$HOME/artifactory"
 echo "[*] Project Root: $ROOT_DIR"
 echo "[*] Engine Dir:   $ARTIFACTORY_DIR"
 
-# 1. Symlink ~/.artifactory or ~/artifactory to the nested folder for clean execution paths
+# 1. Symlink ~/artifactory to the nested folder for clean, uniform paths
 if [ "$ARTIFACTORY_DIR" != "$TARGET_LINK_DIR" ]; then
-    echo "[*] Creating symlink: $TARGET_LINK_DIR ->$ARTIFACTORY_DIR"
+    echo "[*] Creating symlink: $TARGET_LINK_DIR -> $ARTIFACTORY_DIR"
     ln -sfn "$ARTIFACTORY_DIR" "$TARGET_LINK_DIR"
 fi
 
-# 2. Ensure base blackboard directories exist
+# 2. Ensure base blackboard directories and playbook prompt categories exist
 mkdir -p "$ARTIFACTORY_DIR/.blackboard/artifacts"
 mkdir -p "$OPENCODE_CMD_DIR"
 
-# 3. Make core Python scripts executable
+for cat in recon web auth infra logic chaining; do
+    mkdir -p "$ARTIFACTORY_DIR/prompts/$cat"
+done
+
+# 3. Make all core Python scripts executable
+chmod +x "$ARTIFACTORY_DIR/init_env.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/sec_flow.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/playbook_engine.py" 2>/dev/null || true
+chmod +x "$ARTIFACTORY_DIR/ingest.py" 2>/dev/null || true
 
 # 4. Register OpenCode command (/artifactory)
 cat << 'CMD_EOF' > "$OPENCODE_CMD_DIR/artifactory.md"
@@ -34,43 +40,47 @@ cat << 'CMD_EOF' > "$OPENCODE_CMD_DIR/artifactory.md"
 description: Artifactory Agentic Security & Recon Engine
 ---
 
-# Command: /artifactory (Agentic Security Engine)
+# Artifactory Security Engine Integration
 
-Execute security analysis using the local Artifactory Blackboard Architecture.
-
-## Phase 0: Target Initialization & Scope Check (MANDATORY)
-Upon invocation with a target (e.g., `/artifactory target.com`):
-1. **Pause execution** and prompt the user for:
-   - **In-Scope Targets:** Allowed domains, subdomains, or IP ranges.
-   - **Out-of-Scope Targets:** Expressly forbidden targets/endpoints.
-   - **Test Constraints ("Do Not Do"):** Rate limits, destructive test prohibitions.
-   - **Authentication:** Custom headers, cookies, or API keys.
-2. Write/update `.blackboard/scope.json` with confirmed rules before running tools.
+You are the Artifactory Security Engine assistant. You execute structured workflows using local blackboard state, scope enforcement, and dynamic playbook ingestion.
 
 ---
 
-## Phase 1: Execution Mode Selection
-
-### Mode 1: Autonomous Target Analysis (Default)
-When given a target without a specific attack vector:
-1. **Recon & Surface Mapping:** Run discovery via `python3 ~/artifactory/sec_flow.py`.
-2. **Priority Matrix:** Identify core assets and build testing queue.
-3. **Dynamic Playbook Execution:** 
-   - Check `python3 ~/artifactory/playbook_engine.py --category <cat> --name <name>`.
-   - If missing, ask practitioner for tradecraft / draft template in `prompts/`.
-   - Log findings to `.blackboard/board.json`.
-
-### Mode 2: Urgent / Direct Vector Testing
-When testing a single vector (e.g., `/artifactory test HTTP Smuggling on target.com`):
-1. Verify target scope via `scope.json`.
-2. Check `python3 ~/artifactory/playbook_engine.py --category <cat> --name <name>`.
-3. If missing, draft practitioner playbook and execute immediately.
+## 🚨 Operational & Context Rules:
+1. **Never run raw execution tools directly.** Always route diagnostic commands through:
+   `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`
+2. **Context Preservation & Output Inspection:**
+   - Never attempt to read or load raw `.log` files from `.blackboard/artifacts/`.
+   - If a command output is truncated with `[+] Output truncated (>100 lines)`, query specific lines using:
+     `python3 ~/artifactory/sec_flow.py inspect --id <POINTER_ID> --grep "<regex_pattern>" --lines 30`
+   - For structured JSON tool output, extract fields using:
+     `python3 ~/artifactory/sec_flow.py inspect --id <POINTER_ID> --json-key "<key>"`
+3. **Automated State Tracking:**
+   - When new assets (ports, hosts, endpoints) or observations are identified, log them immediately:
+     `python3 ~/artifactory/sec_flow.py add-asset --endpoint "/api/v1/auth" --port "8080"`
+   - Record confirmed findings using:
+     `python3 ~/artifactory/sec_flow.py add-asset --finding "<Title>" --details "<Short Summary>"`
 
 ---
 
-## Safety & Context Isolation:
-- **Hard Gate:** Pass all commands through `python3 ~/artifactory/sec_flow.py`.
-- **Pointer-Based Logs:** Save raw CLI output to `.blackboard/artifacts/` via `sec_flow.py`.
+## Slash Commands
+
+### 1. `/artifactory analyze <target>`
+- Initialize workspace state if missing: `python3 ~/artifactory/init_env.py --target .`
+- Run initial discovery commands via `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`.
+- Inspect truncated results using `sec_flow.py inspect` if specific headers or paths are needed.
+- Log discovered endpoints, hosts, and open ports using `sec_flow.py add-asset`.
+
+### 2. `/artifactory test <target> for <vulnerability>`
+- Load and render tradecraft variables via: `python3 ~/artifactory/playbook_engine.py --category <category> --name <vulnerability> --target "<target>"`
+- Execute safe test commands sequentially via `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`.
+- If an impact or finding is verified, log it using `sec_flow.py add-asset --finding "<Title>"`.
+
+### 3. `/artifactory ingest <URL or File Path>`
+When provided a writeup link, security article, or local text file:
+1. **Extract & Quality Check:** Check for concrete HTTP methods, parameters, or CLI mechanics.
+2. **User Review (Human-in-the-Loop):** Present a summary (Title, Source, Category, Key Mechanics) for user confirmation.
+3. **Compile & Save:** Run `python3 ~/artifactory/ingest.py --file <temp_path> --category <category> --name <playbook_name> --source <URL>`.
 CMD_EOF
 
 echo "[+] Registered /artifactory command in $OPENCODE_CMD_DIR/artifactory.md"
@@ -88,6 +98,6 @@ done
 echo ""
 echo "=================================================="
 echo "   [✓] Artifactory Setup Complete!               "
-echo "   Run '/artifactory analyze target.com' in       "
+echo "   Run '/artifactory analyze <target>' in        "
 echo "   OpenCode to start testing.                    "
 echo "=================================================="
