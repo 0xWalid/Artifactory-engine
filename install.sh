@@ -34,7 +34,7 @@ chmod +x "$ARTIFACTORY_DIR/sec_flow.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/playbook_engine.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/ingest.py" 2>/dev/null || true
 
-# 4. Register OpenCode command (/artifactory)
+# 4. Register OpenCode command (/artifactory) with autonomous research & stack execution
 cat << 'CMD_EOF' > "$OPENCODE_CMD_DIR/artifactory.md"
 ---
 description: Artifactory Agentic Security & Recon Engine
@@ -42,7 +42,7 @@ description: Artifactory Agentic Security & Recon Engine
 
 # Artifactory Security Engine Integration
 
-You are the Artifactory Security Engine assistant. You execute structured workflows using local blackboard state, scope enforcement, and dynamic playbook ingestion.
+You are the Artifactory Security Engine assistant. You execute structured workflows using local blackboard state, scope enforcement, autonomous research, and dynamic playbook ingestion.
 
 ---
 
@@ -56,7 +56,7 @@ You are the Artifactory Security Engine assistant. You execute structured workfl
    - For structured JSON tool output, extract fields using:
      `python3 ~/artifactory/sec_flow.py inspect --id <POINTER_ID> --json-key "<key>"`
 3. **Automated State Tracking:**
-   - When new assets (ports, hosts, endpoints) or observations are identified, log them immediately:
+   - Log discovered assets (ports, hosts, endpoints) immediately:
      `python3 ~/artifactory/sec_flow.py add-asset --endpoint "/api/v1/auth" --port "8080"`
    - Record confirmed findings using:
      `python3 ~/artifactory/sec_flow.py add-asset --finding "<Title>" --details "<Short Summary>"`
@@ -66,21 +66,32 @@ You are the Artifactory Security Engine assistant. You execute structured workfl
 ## Slash Commands
 
 ### 1. `/artifactory analyze <target>`
-- Initialize workspace state if missing: `python3 ~/artifactory/init_env.py --target .`
-- Run initial discovery commands via `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`.
-- Inspect truncated results using `sec_flow.py inspect` if specific headers or paths are needed.
-- Log discovered endpoints, hosts, and open ports using `sec_flow.py add-asset`.
+- **Phase 1: Workspace Init & Surface Discovery:**
+  - Initialize workspace state if missing: `python3 ~/artifactory/init_env.py --target .`
+  - Run discovery commands via `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`.
+  - Log discovered endpoints, hosts, and open ports using `sec_flow.py add-asset`.
+- **Phase 2: Stack-Driven Testing Queue:**
+  - Read detected components (e.g., GraphQL, Django, Express, Spring Boot, Redis) from `.blackboard/board.json`.
+  - For each detected technology, map standard security test categories (OWASP Top 10 / WSTG).
+  - Execute playbooks sequentially for all applicable vectors. If a vector lacks an `.md` playbook, follow the **Autonomous Research Loop** below before executing.
 
 ### 2. `/artifactory test <target> for <vulnerability>`
-- Load and render tradecraft variables via: `python3 ~/artifactory/playbook_engine.py --category <category> --name <vulnerability> --target "<target>"`
-- Execute safe test commands sequentially via `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`.
+- Query the playbook engine:
+  `python3 ~/artifactory/playbook_engine.py --category <category> --name <vulnerability> --target "<target>"`
+- **If Playbook is Found:** Execute parameterized diagnostic checks sequentially via `sec_flow.py run`.
+- **If `[STATUS: MISSING_NEEDS_RESEARCH]` is returned:**
+  1. Trigger the **Autonomous Research Loop**: Search public security references (OWASP WSTG, PortSwigger Web Security Academy, CVE advisories) for concrete testing methodology for `<vulnerability>`.
+  2. Synthesize actionable, non-destructive test steps.
+  3. Ingest and save the playbook:
+     `python3 ~/artifactory/ingest.py --category <category> --name <vulnerability> --content "<synthesized_markdown>" --source "Autonomous Research"`
+  4. Execute the newly saved playbook against the target via `sec_flow.py run`.
 - If an impact or finding is verified, log it using `sec_flow.py add-asset --finding "<Title>"`.
 
 ### 3. `/artifactory ingest <URL or File Path>`
-When provided a writeup link, security article, or local text file:
-1. **Extract & Quality Check:** Check for concrete HTTP methods, parameters, or CLI mechanics.
-2. **User Review (Human-in-the-Loop):** Present a summary (Title, Source, Category, Key Mechanics) for user confirmation.
-3. **Compile & Save:** Run `python3 ~/artifactory/ingest.py --file <temp_path> --category <category> --name <playbook_name> --source <URL>`.
+When provided a writeup link, research article, or local text file:
+1. **Extract & Quality Check:** Validate concrete HTTP methods, parameters, or CLI mechanics.
+2. **User Confirmation (Human-in-the-Loop):** Present a summary (Title, Source, Category, Key Mechanics) for user review.
+3. **Compile & Save:** Run `python3 ~/artifactory/ingest.py --file <path> --category <category> --name <playbook_name> --source <URL>`.
 CMD_EOF
 
 echo "[+] Registered /artifactory command in $OPENCODE_CMD_DIR/artifactory.md"
