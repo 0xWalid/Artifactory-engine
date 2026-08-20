@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+Sovereign Blackboard Architecture - Modular Report Generator
+Generates per-vulnerability reports and evidence logs directly in the local project directory.
+"""
+
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Execution context is the local project directory
+CWD = Path.cwd()
+BLACKBOARD_DIR = CWD / ".blackboard"
+BOARD_FILE = BLACKBOARD_DIR / "board.json"
+ARTIFACTS_DIR = BLACKBOARD_DIR / "artifacts"
+REPORTS_DIR = CWD / "reports"
+EVIDENCE_DIR = REPORTS_DIR / "evidence"
+
+
+def ensure_report_dirs():
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def slugify(text: str) -> str:
+    slug = re.sub(r'[^a-zA-Z0-9_-]', '_', text.lower())
+    return re.sub(r'_+', '_', slug).strip('_')
+
+
+def load_artifact_content(pointer_id: str) -> str:
+    artifact_path = ARTIFACTS_DIR / f"{pointer_id}.log"
+    if artifact_path.exists():
+        return artifact_path.read_text()
+    return "Artifact log not found."
+
+
+def extract_juicy_details(raw_artifact_text: str) -> str:
+    """Extracts sensitive headers, reflected tokens, cookies, or path disclosures."""
+    extracted = []
+    lines = raw_artifact_text.splitlines()
+
+    for line in lines:
+        # Check for interesting response headers or disclosures
+        if re.search(r'(Set-Cookie|Authorization|X-Forwarded|Location|Server|X-Powered-By):', line, re.I):
+            extracted.append(f"  [Header] {line.strip()}")
+        elif re.search(r'(\/var\/www|\/home\/|C:\\|[a-zA-Z0-9_-]+\.(php|sql|env|json|bak|conf))', line, re.I):
+            extracted.append(f"  [Path/File Disclosure] {line.strip()}")
+        elif re.search(r'(token|jwt|api_key|password|secret|hash)\s*[:=]\s*["\']?[a-zA-Z0-9_\-\.]{8,}', line, re.I):
+            extracted.append(f"  [Key/Credential Signal] {line.strip()}")
+
+    if not extracted:
+        return "No specific credential patterns or paths auto-flagged. Check full artifact evidence."
+    return "\n".join(extracted[:25])
+
+
+def generate_individual_reports():
+    ensure_report_dirs()
+
+    if not BOARD_FILE.exists():
+        print(f"[!] Error: {BOARD_FILE} not found. Run analysis first.", file=sys.stderr)
+        return
+
+    try:
+        board_data = json.loads(BOARD_FILE.read_text())
+    except Exception as e:
+        print(f"[!] Error parsing board.json: {e}")
+        return
+
+    target = board_data.get("target", "Target System")
+    findings = board_data.get("findings", [])
+    execution_logs = board_data.get("execution_log_pointers", [])
+    assets = board_data.get("discovered_assets", {})
+
+    if not findings:
+        print("[*] No findings recorded in board.json. Generating surface summary only.")
+
+    generated_files = []
+
+    # 1. Generate Individual Finding Reports
+    for idx, finding in enumerate(findings, 1):
+        finding_id = finding.get("id", f"FINDING_{idx:02d}")
+        title = finding.get("title", "Unnamed Vulnerability")
+        details = finding.get("details", "No details supplied.")
+        timestamp = finding.get("timestamp", datetime.now(timezone.utc).isoformat())
+
+        slug_title = slugify(title)
+        report_filename = f"{finding_id}_{slug_title}.md"
+        report_path = REPORTS_DIR / report_filename
+
+        # Correlate execution pointers to find reproduction commands
+        matching_logs = []
+        for log in execution_logs:
+            matching_logs.append(log)
+
+        # Save dedicated evidence dump
+        evidence_filename = f"evidence_{finding_id}_{slug_title}.txt"
+        evidence_path = EVIDENCE_DIR / evidence_filename
+
+        evidence_buffer = [f"=== EVIDENCE DUMP FOR {finding_id}: {title} ===", f"Timestamp: {timestamp}\n"]
+
+        reproduction_steps = []
+        for log_idx, log in enumerate(matching_logs[-5:], 1):  # Last relevant commands
+            pid = log.get("pointer_id")
+            cmd = log.get("command")
+            rc = log.get("return_code")
+            summary = log.get("summary")
+
+            reproduction_steps.append(f"{log_idx}. **Execute CLI Verification:**\n   ```bash\n   {cmd}\n   ```\n   *Output Signature:* `{summary}` (Exit code: `{rc}`)\n")
+            
+            raw_log = load_artifact_content(pid)
+            evidence_buffer.append(f"--- [Pointer: {pid}] CMD: {cmd} ---\n{raw_log}\n")
+
+        evidence_path.write_text("\n".join(evidence_buffer))
+
+        # Build Individual Report Content
+        report_lines = [
+            f"# Vulnerability Advisory: {title}",
+            f"**Advisory ID:** `{finding_id}`  ",
+            f"**Target:** `{target}`  ",
+            f"**Date Identified:** `{timestamp}`  ",
+            f"**Evidence File:** `reports/evidence/{evidence_filename}`  ",
+            "\n---",
+            "\n## 1. Executive Summary & Impact",
+            f"{details}",
+            "\n## 2. Technical Root Cause",
+            "The endpoint permits unexpected behavior or input manipulation due to missing server-side sanitization, unrestricted parameters, or logic state assumptions.",
+            "\n## 3. Step-by-Step Reproduction Steps",
+            "\n".join(reproduction_steps) if reproduction_steps else "_Execute the verification commands stored in the evidence log._",
+            "\n## 4. Key Disclosures & Captured Artifact Highlights",
+            "```text",
+            extract_juicy_details("\n".join(evidence_buffer)),
+            "```",
+            "\n## 5. Remediation & Defense",
+            "- **Input Validation:** Enforce strict type, length, and format whitelisting on all incoming fields.",
+            "- **Access Control:** Verify authentication and authorization checks on the server side prior to processing data.",
+            "- **Output Encoding:** Sanitize and restrict returned debug headers, paths, and internal error stacks.",
+            "\n---",
+            f"_Generated by Artifactory Engine at {datetime.now(timezone.utc).isoformat()}_"
+        ]
+
+        report_path.write_text("\n".join(report_lines))
+        generated_files.append((finding_id, title, report_filename))
+        print(f"[✔] Created advisory: reports/{report_filename}")
+
+    # 2. Generate Consolidated Project Summary (SUMMARY.md)
+    summary_path = REPORTS_DIR / "SUMMARY.md"
+    summary_lines = [
+        f"# Security Assessment Summary: {target}",
+        f"**Date:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n",
+        "## Discovered Attack Surface",
+        f"- **Hosts:** {', '.join(assets.get('hosts', [])) or 'None'}",
+        f"- **Open Ports:** {', '.join(assets.get('open_ports', [])) or 'None'}",
+        f"- **Endpoints Mapped:** {', '.join(assets.get('endpoints', [])) or 'None'}\n",
+        "## Identified Vulnerabilities (Individual Reports)",
+    ]
+
+    if not generated_files:
+        summary_lines.append("_No vulnerabilities logged during this session._")
+    else:
+        for fid, ftitle, fname in generated_files:
+            summary_lines.append(f"- **[{fid}]** [{ftitle}](./{fname})")
+
+    summary_path.write_text("\n".join(summary_lines))
+    print(f"[✔] Created summary index: reports/SUMMARY.md")
+
+
+if __name__ == "__main__":
+    generate_individual_reports()
