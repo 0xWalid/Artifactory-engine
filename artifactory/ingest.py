@@ -52,10 +52,10 @@ def quality_gate_check(content: str) -> tuple[bool, str]:
     if score >= 1:
         return True, f"Passed Quality Gate (Score: {score}/3 - Actionable technical mechanics identified)."
     else:
-        return False, "Failed Quality Gate: Writeup lacks concrete CLI commands, HTTP methods, or parameter targets."
+        return False, "Failed Quality Gate: Content lacks concrete CLI commands, HTTP methods, or parameter targets."
 
 
-def save_or_merge_playbook(category: str, name: str, content: str, source_ref: str = ""):
+def save_or_merge_playbook(category: str, name: str, content: str, source_ref: str = "") -> Path:
     """Saves a new playbook or appends elevated strategy to an existing one."""
     slug = name.lower().replace(" ", "_").replace("-", "_")
     if not slug.endswith(".md"):
@@ -73,7 +73,7 @@ def save_or_merge_playbook(category: str, name: str, content: str, source_ref: s
     if file_path.exists():
         print(f"[*] Updating existing playbook at: {file_path}")
         with open(file_path, "a") as f:
-            f.write(f"\n\n---\n\n## 🔄 Elevated Strategy / Additional Vector\n")
+            f.write("\n\n---\n\n## 🔄 Elevated Strategy / Additional Vector\n")
             if source_ref:
                 f.write(f"**Source:** {source_ref}\n\n")
             f.write(content)
@@ -82,31 +82,41 @@ def save_or_merge_playbook(category: str, name: str, content: str, source_ref: s
         with open(file_path, "w") as f:
             f.write(header + content)
 
+    return file_path
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tradecraft Ingestion Engine")
     parser.add_argument("--file", "-f", help="Path to raw writeup text file")
+    parser.add_argument("--content", help="Raw text content to ingest directly (can also be read from stdin)")
     parser.add_argument("--category", "-c", required=True, choices=["recon", "web", "auth", "infra", "logic", "chaining"])
     parser.add_argument("--name", "-n", required=True, help="Playbook target name (e.g., graphql_idor)")
     parser.add_argument("--source", "-s", default="", help="Source reference URL or Article title")
     parser.add_argument("--target-domain", "-t", default="", help="Specific target domain to strip out if known")
+    parser.add_argument("--force", action="store_true", help="Bypass quality gate check if needed")
 
     args = parser.parse_args()
 
-    if not args.file or not os.path.exists(args.file):
-        print("[!] Error: Valid --file path required.", file=sys.stderr)
+    raw_text = ""
+    if args.content:
+        raw_text = args.content
+    elif args.file and os.path.exists(args.file):
+        with open(args.file, "r") as f:
+            raw_text = f.read()
+    elif not sys.stdin.isatty():
+        raw_text = sys.stdin.read()
+
+    if not raw_text.strip():
+        print("[!] Error: Input content required via --file, --content, or stdin.", file=sys.stderr)
         sys.exit(1)
 
-    with open(args.file, "r") as f:
-        raw_text = f.read()
-
-    passed, reason = quality_gate_check(raw_text)
-    print(f"[*] Quality Check: {reason}")
-
-    if not passed:
-        print("[!] Ingestion aborted. Input material is missing actionable execution steps.")
-        sys.exit(1)
+    if not args.force:
+        passed, reason = quality_gate_check(raw_text)
+        print(f"[*] Quality Check: {reason}")
+        if not passed:
+            print("[!] Ingestion aborted. Input material is missing actionable execution steps.")
+            sys.exit(1)
 
     parameterized_text = strip_and_parameterize(raw_text, args.target_domain)
-    save_or_merge_playbook(args.category, args.name, parameterized_text, args.source)
-    print("[✔] Ingestion complete.")
+    saved_path = save_or_merge_playbook(args.category, args.name, parameterized_text, args.source)
+    print(f"[✔] Ingestion complete: {saved_path}")

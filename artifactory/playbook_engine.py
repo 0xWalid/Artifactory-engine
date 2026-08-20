@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Sovereign Blackboard Architecture - On-Demand Playbook Engine
-Checks, generates, and renders practitioner playbooks with target parameter substitution.
+Checks, generates, renders, and persists practitioner playbooks with target parameter substitution.
 """
 
 import argparse
@@ -35,57 +35,70 @@ def render_playbook(content: str, target: str = "", auth_token: str = "") -> str
     return rendered
 
 
-def check_or_create_playbook(category: str, name: str, author: str = "Practitioner", target: str = "", auth_token: str = ""):
+def save_researched_playbook(category: str, name: str, content: str, author: str = "Synthesized Tradecraft") -> Path:
+    """Saves newly researched tradecraft into the local playbook repository."""
     target_path = get_playbook_path(category, name)
     target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    header = f"# Micro-Playbook: {name.replace('_', ' ').title()}\n"
+    header += f"**Practitioner / Methodology:** {author}\n"
+    header += f"**Category:** {category}\n\n"
+
+    target_path.write_text(header + content.strip())
+    return target_path
+
+
+def check_or_fetch_playbook(category: str, name: str, target: str = "", auth_token: str = "") -> tuple[Path, str, bool]:
+    """
+    Checks if a playbook exists.
+    Returns (path, content, is_found).
+    """
+    target_path = get_playbook_path(category, name)
 
     if target_path.exists():
         raw_content = target_path.read_text()
         rendered_content = render_playbook(raw_content, target, auth_token)
-        return target_path, rendered_content, False
+        return target_path, rendered_content, True
 
-    # Standard starter template
-    template = f"""# Micro-Playbook: {name.replace('_', ' ').title()}
-**Practitioner / Methodology:** {author}
-**Category:** {category}
+    # Signal to OpenCode that tradecraft must be synthesized/researched
+    research_prompt = f"""[STATUS: MISSING_NEEDS_RESEARCH]
+Playbook not found at: {target_path}
+Category: {category}
+Vulnerability/Vector: {name}
 
-## 1. Objective
-Describe the target scenario or vector.
-
-## 2. Methodology & Step-by-Step Tradecraft
-1. **Initial Vector:** Identify relevant endpoints and headers on `{{{{TARGET_URL}}}}`.
-2. **Probing & Diagnostic Testing:** Non-destructive test commands.
-3. **Verification:** Confirm status without disrupting operations.
-
-## 3. Operational Constraints
-- Execute all commands via `sec_flow.py run --cmd "<command>" --target "{{{{TARGET_HOST}}}}"`.
-- Query large outputs via `sec_flow.py inspect --id <POINTER_ID>`.
+ACTION REQUIRED:
+1. Search industry sources (OWASP WSTG, PortSwigger Web Security, CVE advisories) for '{name}' targeting '{category}'.
+2. Extract concrete, non-destructive diagnostic CLI commands (curl, httpx, ffuf) and response indicators.
+3. Save the tradecraft via:
+   python3 ~/artifactory/playbook_engine.py --category {category} --name {name} --save-content "<content>"
+4. Re-execute the test.
 """
-    target_path.write_text(template)
-    rendered_template = render_playbook(template, target, auth_token)
-    return target_path, rendered_template, True
+    return target_path, research_prompt, False
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="On-Demand Playbook Engine")
     parser.add_argument("--category", "-c", required=True, choices=["recon", "web", "auth", "infra", "logic", "chaining"])
-    parser.add_argument("--name", "-n", required=True, help="Playbook name (e.g., graphql_idor)")
-    parser.add_argument("--author", "-a", default="Practitioner", help="Author/Practitioner reference")
-    parser.add_argument("--target", "-t", default="", help="Target URL/Host for dynamic variable substitution")
+    parser.add_argument("--name", "-n", required=True, help="Playbook name (e.g., graphql_idor, s3_bucket_leak)")
+    parser.add_argument("--author", "-a", default="Industry Specialist", help="Author/Practitioner reference")
+    parser.add_argument("--target", "-t", default="", help="Target URL/Host for dynamic parameter substitution")
     parser.add_argument("--auth-token", default="", help="Optional Bearer token for variable substitution")
+    parser.add_argument("--save-content", help="Directly save newly synthesized playbook content")
 
     args = parser.parse_args()
-    path, content, is_new = check_or_create_playbook(
+
+    if args.save_content:
+        saved_path = save_researched_playbook(args.category, args.name, args.save_content, args.author)
+        print(f"[✔] Successfully saved synthesized playbook to: {saved_path}")
+        sys.exit(0)
+
+    path, content, found = check_or_fetch_playbook(
         category=args.category,
         name=args.name,
-        author=args.author,
         target=args.target,
         auth_token=args.auth_token
     )
 
-    if is_new:
-        print(f"[MISSING] Created initial template at: {path}\n")
-    else:
-        print(f"[FOUND] Loaded playbook: {path}\n")
-
+    if found:
+        print(f"[STATUS: FOUND] Loaded playbook: {path}\n")
     print(content)
