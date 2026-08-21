@@ -1,0 +1,13 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Per-target runtime workspaces (created by init_env.py) — not engine code
+.blackboard/
+reports/
+
+# Local environment
+.env
+.venv/
+venv/
