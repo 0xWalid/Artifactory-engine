@@ -8,6 +8,7 @@ JSON-aware inspection, and state asset recording.
 import argparse
 import ipaddress
 import json
+import os
 import re
 import shlex
 import socket
@@ -120,6 +121,22 @@ def trigger_report_generation():
         print(f"[!] Warning: auto-report generation failed: {e}", file=sys.stderr)
 
 
+def trigger_triage(pointer_id: str):
+    """Runs the background triage/Scout pass on a completed artifact.
+
+    Extracts ranked leads into board.json so the operator consumes a short
+    lead list instead of raw output. Lazily imported; failures degrade quietly.
+    """
+    try:
+        engine_dir = str(Path(__file__).resolve().parent)
+        if engine_dir not in sys.path:
+            sys.path.insert(0, engine_dir)
+        import triage
+        triage.triage_pointer(pointer_id)
+    except Exception as e:
+        print(f"[!] Warning: triage pass failed: {e}", file=sys.stderr)
+
+
 def add_asset_to_board(host: str = None, endpoint: str = None, port: str = None, finding: str = None, details: str = ""):
     if not BOARD_FILE.exists():
         print(f"[!] Error: {BOARD_FILE} not found. Run init_env.py first.", file=sys.stderr)
@@ -227,8 +244,9 @@ def is_destructive_command(cmd: str) -> tuple[bool, str]:
     return False, ""
 
 
-def run_command(cmd: str, target: str = None):
-    ensure_blackboard_dirs()
+def preflight_checks(cmd: str, target: str) -> str:
+    """Runs every hard gate before a command may execute. Exits the process on
+    any violation. Returns the resolved canary token (for the post-exec scan)."""
     scope = load_json(SCOPE_FILE)
 
     # Fail-closed scope gate: refuse to execute unless a populated scope exists
@@ -278,10 +296,16 @@ def run_command(cmd: str, target: str = None):
             )
             sys.exit(1)
 
-    pointer_id = f"MSG_{uuid.uuid4().hex[:8].upper()}"
+    return canary
+
+
+def execute_and_log(cmd: str, pointer_id: str, canary: str, quiet: bool = False):
+    """Runs a pre-validated command, logs the artifact, updates the board, and
+    performs the canary post-check. Assumes preflight_checks already passed."""
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    print(f"[*] Executing [{pointer_id}]: {cmd}")
+    if not quiet:
+        print(f"[*] Executing [{pointer_id}]: {cmd}")
 
     try:
         cmd_args = shlex.split(cmd)
@@ -321,17 +345,101 @@ def run_command(cmd: str, target: str = None):
     summary = lines[0] if lines else ("Error" if stderr else "Empty Output")
     update_board_state(pointer_id, cmd, returncode, summary[:120])
 
-    if len(lines) > 100:
-        print(f"[+] Output truncated (>100 lines). Full log: .blackboard/artifacts/{pointer_id}.log")
-        print("\n".join(lines[:20]))
-        print(f"\n... [{len(lines) - 40} lines omitted] ...\n")
-        print("\n".join(lines[-20:]))
-    else:
-        if stdout:
-            print(stdout)
+    if not quiet:
+        if len(lines) > 100:
+            print(f"[+] Output truncated (>100 lines). Full log: .blackboard/artifacts/{pointer_id}.log")
+            print("\n".join(lines[:20]))
+            print(f"\n... [{len(lines) - 40} lines omitted] ...\n")
+            print("\n".join(lines[-20:]))
+        else:
+            if stdout:
+                print(stdout)
+        if stderr:
+            print(stderr, file=sys.stderr)
 
-    if stderr:
-        print(stderr, file=sys.stderr)
+
+def launch_background(cmd: str, target: str, pointer_id: str):
+    """Spawns a detached child that runs the (already-validated) command, logs
+    it, and triages the result into leads — without blocking the operator."""
+    child = [
+        sys.executable, str(Path(__file__).resolve()),
+        "_bg-exec", "--cmd", cmd, "--target", target, "--pointer", pointer_id,
+    ]
+    with open(os.devnull, "wb") as devnull:
+        subprocess.Popen(
+            child, cwd=str(Path.cwd()), stdout=devnull, stderr=devnull,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+
+
+def run_command(cmd: str, target: str = None, background: bool = False):
+    ensure_blackboard_dirs()
+    canary = preflight_checks(cmd, target)
+    pointer_id = f"MSG_{uuid.uuid4().hex[:8].upper()}"
+
+    if background:
+        launch_background(cmd, target, pointer_id)
+        print(
+            f"[*] Backgrounded [{pointer_id}]: {cmd}\n"
+            f"    Results + leads will land on board.json when it finishes. "
+            f"Pull them with: sec_flow.py leads"
+        )
+        return
+
+    execute_and_log(cmd, pointer_id, canary)
+    trigger_triage(pointer_id)
+
+
+def bg_exec(cmd: str, target: str, pointer_id: str):
+    """Internal entrypoint for the detached background child. Re-runs preflight
+    (defense in depth) then executes + triages quietly."""
+    ensure_blackboard_dirs()
+    canary = preflight_checks(cmd, target)
+    execute_and_log(cmd, pointer_id, canary, quiet=True)
+    trigger_triage(pointer_id)
+
+
+def show_leads(status: str = None, ltype: str = None, limit: int = 20,
+               lead_id: str = None, set_status: str = None):
+    """Operator-facing: the short ranked lead list (not raw logs), or update one."""
+    board = load_json(BOARD_FILE)
+    if not board:
+        print(f"[!] Error: {BOARD_FILE} not found. Run init_env.py first.", file=sys.stderr)
+        sys.exit(1)
+    leads = board.get("leads", [])
+
+    # Mutation mode: update a single lead's status.
+    if lead_id and set_status:
+        found = False
+        for l in leads:
+            if l.get("id") == lead_id:
+                l["status"] = set_status
+                found = True
+                break
+        if not found:
+            print(f"[!] Lead '{lead_id}' not found.", file=sys.stderr)
+            sys.exit(1)
+        board["updated_at"] = datetime.now(timezone.utc).isoformat()
+        BOARD_FILE.write_text(json.dumps(board, indent=2))
+        print(f"[✔] Lead {lead_id} -> status '{set_status}'")
+        return
+
+    view = [
+        l for l in leads
+        if (not status or l.get("status") == status)
+        and (not ltype or l.get("type") == ltype)
+    ]
+    view.sort(key=lambda l: l.get("confidence", 0), reverse=True)
+    if not view:
+        print("[*] No leads match (run some recon via 'run' first).")
+        return
+
+    print(f"[*] Leads ({len(view)} shown, ranked by confidence):\n")
+    for l in view[:limit]:
+        print(f"  [{l.get('confidence')}] {l.get('id')} ({l.get('type')}/{l.get('status')}) "
+              f"{l.get('value')}")
+        if l.get("suggested_next"):
+            print(f"        ↳ next: {l['suggested_next']}  (src {l.get('source_pointer')})")
 
 
 def inspect_artifact(pointer_id: str, grep_pattern: str = None, json_key: str = None, max_lines: int = 50):
@@ -391,6 +499,16 @@ if __name__ == "__main__":
     run_parser = subparsers.add_parser("run", help="Run command and log artifacts")
     run_parser.add_argument("--cmd", required=True, help="Command to execute")
     run_parser.add_argument("--target", help="Target domain/host to validate against scope")
+    run_parser.add_argument(
+        "--background", "--bg", action="store_true", dest="background",
+        help="Run detached: return immediately, log + triage results to board.json when done",
+    )
+
+    # _bg-exec (internal: the detached child entrypoint for --background)
+    bg_parser = subparsers.add_parser("_bg-exec", help=argparse.SUPPRESS)
+    bg_parser.add_argument("--cmd", required=True)
+    bg_parser.add_argument("--target", required=True)
+    bg_parser.add_argument("--pointer", required=True)
 
     # inspect
     inspect_parser = subparsers.add_parser("inspect", help="Inspect and query artifact logs")
@@ -407,11 +525,23 @@ if __name__ == "__main__":
     asset_parser.add_argument("--finding", help="Vulnerability or observation title")
     asset_parser.add_argument("--details", default="", help="Short description of the finding")
 
+    # leads (operator-facing: consume ranked leads instead of raw logs)
+    leads_parser = subparsers.add_parser("leads", help="Show/triage ranked leads on the board")
+    leads_parser.add_argument("--status", help="Filter by status (new|testing|confirmed|dead)")
+    leads_parser.add_argument("--type", dest="ltype", help="Filter by type (endpoint|port|subdomain|tech|anomaly)")
+    leads_parser.add_argument("--limit", type=int, default=20, help="Max leads to show (default: 20)")
+    leads_parser.add_argument("--id", dest="lead_id", help="Lead ID to update")
+    leads_parser.add_argument("--set-status", dest="set_status", help="New status for --id")
+
     args = parser.parse_args()
 
     if args.subcommand == "run":
-        run_command(args.cmd, args.target)
+        run_command(args.cmd, args.target, args.background)
+    elif args.subcommand == "_bg-exec":
+        bg_exec(args.cmd, args.target, args.pointer)
     elif args.subcommand == "inspect":
         inspect_artifact(args.id, args.grep, args.json_key, args.lines)
     elif args.subcommand == "add-asset":
         add_asset_to_board(args.host, args.endpoint, args.port, args.finding, args.details)
+    elif args.subcommand == "leads":
+        show_leads(args.status, args.ltype, args.limit, args.lead_id, args.set_status)

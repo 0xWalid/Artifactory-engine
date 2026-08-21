@@ -20,6 +20,7 @@ def init_target_workspace(target_dir: Path):
     board_file = blackboard_dir / "board.json"
     scope_file = blackboard_dir / "scope.json"
     canary_file = blackboard_dir / "canaries.json"
+    scout_file = blackboard_dir / "scout.json"
 
     blackboard_dir.mkdir(exist_ok=True)
     artifacts_dir.mkdir(exist_ok=True)
@@ -30,7 +31,7 @@ def init_target_workspace(target_dir: Path):
 
     if not board_file.exists():
         initial_board = {
-            "version": "1.1.0",
+            "version": "1.2.0",
             "target_path": str(target_dir),
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "discovered_assets": {
@@ -39,6 +40,7 @@ def init_target_workspace(target_dir: Path):
                 "open_ports": []
             },
             "findings": [],
+            "leads": [],
             "execution_log_pointers": []
         }
         board_file.write_text(json.dumps(initial_board, indent=2))
@@ -67,6 +69,40 @@ def init_target_workspace(target_dir: Path):
         print(f"[+] Created: {canary_file.name}")
     else:
         print(f"[*] Exists (Skipped): {canary_file.name}")
+
+    if not scout_file.exists():
+        # Background "Scout" brain config. Provider-agnostic and OpenAI-compatible:
+        # the Scout digests raw tool output into ranked leads so the expensive
+        # operator model never has to read the firehose. Disabled by default;
+        # triage still works deterministically (no model calls) until enabled.
+        initial_scout = {
+            "enabled": True,
+            "base_url": "https://api.groq.com/openai/v1",
+            "model": "llama-3.3-70b-versatile",
+            "api_key_env": "GROQ_API_KEY",
+            "fallbacks": [
+                {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": "meta-llama/llama-3.3-70b-instruct:free",
+                    "api_key_env": "OPENROUTER_API_KEY"
+                }
+            ],
+            "max_leads_per_triage": 8,
+            "request_timeout": 20,
+            "_note": (
+                "The Groq -> OpenRouter failover chain also lives in the engine "
+                "code (triage.KNOWN_PROVIDERS), so ranking works even if this file "
+                "is deleted or incomplete: just export GROQ_API_KEY and/or "
+                "OPENROUTER_API_KEY. A provider is only used if its api_key_env is "
+                "set; with no keys, deterministic triage runs alone. This file lets "
+                "you override models/order or add providers (Cerebras, Gemini's "
+                "OpenAI endpoint, ...). Set enabled=false to hard-disable the model."
+            ),
+        }
+        scout_file.write_text(json.dumps(initial_scout, indent=2))
+        print(f"[+] Created: {scout_file.name}")
+    else:
+        print(f"[*] Exists (Skipped): {scout_file.name}")
 
     print("[✔] Workspace setup complete.\n")
 
