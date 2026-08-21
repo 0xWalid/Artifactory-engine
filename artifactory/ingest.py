@@ -17,23 +17,42 @@ def strip_and_parameterize(raw_text: str, custom_target: str = None) -> str:
     """
     Strips specific domains, IPs, and hardcoded values from raw writeups,
     replacing them with SBA template variables.
+
+    Ordering is deliberate to avoid double-substitution:
+      1. explicit target  2. bearer tokens  3. full URLs (scheme + domain/IP,
+      preserving the path)  4. standalone IPv4  5. bare domains.
+    URLs are handled before bare IPs/domains so a scheme'd host is not first
+    mangled into a host placeholder and then left as a broken URL.
     """
     text = raw_text
 
     if custom_target:
         text = text.replace(custom_target, "{{TARGET_HOST}}")
 
-    # Replace specific IPs
+    # Authorization bearer tokens (JWT-style or opaque) -> template variable.
+    text = re.sub(
+        r'Bearer\s+[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+\.?[A-Za-z0-9\-_.+/=]*',
+        'Bearer {{AUTH_TOKEN}}',
+        text,
+    )
+
+    # Full URLs: scheme + (IPv4 | dotted domain) + optional port. The trailing
+    # path/query is intentionally preserved so endpoints survive in the playbook.
+    text = re.sub(
+        r'https?://(?:\d{1,3}(?:\.\d{1,3}){3}|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?::\d+)?',
+        '{{TARGET_URL}}',
+        text,
+    )
+
+    # Standalone IPv4 addresses (any that were not part of a URL above).
     text = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '{{TARGET_HOST}}', text)
 
-    # Replace common explicit protocols + domains
-    text = re.sub(r'https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?::\d+)?', '{{TARGET_URL}}', text)
-
-    # Replace standalone domain patterns (e.g., target.herokuapp.com)
-    text = re.sub(r'\b[a-zA-Z0-9.-]+\.(?:com|org|net|io|herokuapp\.com|local)\b', '{{TARGET_HOST}}', text)
-
-    # Convert generic authorization tokens/headers
-    text = re.sub(r'Bearer\s+[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*', 'Bearer {{AUTH_TOKEN}}', text)
+    # Standalone bare domains (incl. subdomains) ending in a known TLD.
+    text = re.sub(
+        r'\b(?:[a-zA-Z0-9-]+\.)+(?:com|org|net|io|dev|app|co|edu|gov|local|internal|xyz|me|info)\b',
+        '{{TARGET_HOST}}',
+        text,
+    )
 
     return text
 

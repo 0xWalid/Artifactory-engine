@@ -6,6 +6,7 @@ Generates per-vulnerability reports and evidence logs directly in the local proj
 
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -88,10 +89,15 @@ def generate_individual_reports():
         report_filename = f"{finding_id}_{slug_title}.md"
         report_path = REPORTS_DIR / report_filename
 
-        # Correlate execution pointers to find reproduction commands
-        matching_logs = []
-        for log in execution_logs:
-            matching_logs.append(log)
+        # Correlate execution pointers to THIS finding. If the finding recorded
+        # its own related pointer IDs at add-asset time, use only those so each
+        # advisory shows its real reproduction commands; otherwise fall back to
+        # the most recent commands as a best-effort signal.
+        related_ids = finding.get("related_pointers") or []
+        if related_ids:
+            matching_logs = [log for log in execution_logs if log.get("pointer_id") in related_ids]
+        else:
+            matching_logs = execution_logs[-5:]
 
         # Save dedicated evidence dump
         evidence_filename = f"evidence_{finding_id}_{slug_title}.txt"
