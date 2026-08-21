@@ -28,6 +28,38 @@ ARTIFACTS_DIR = BLACKBOARD_DIR / "artifacts"
 BOARD_FILE = BLACKBOARD_DIR / "board.json"
 SCOUT_FILE = BLACKBOARD_DIR / "scout.json"
 
+# Known OpenAI-compatible free providers, tried in THIS order whenever their
+# API key is exported. This lives in code (not just scout.json) so the failover
+# chain is robust even if a workspace's scout.json is old, partial, or missing:
+# export GROQ_API_KEY and/or OPENROUTER_API_KEY and ranking just works.
+KNOWN_PROVIDERS = [
+    {
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+        "api_key_env": "GROQ_API_KEY",
+    },
+    {
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "api_key_env": "OPENROUTER_API_KEY",
+    },
+]
+
+# Defaults merged UNDER whatever scout.json provides, so missing keys never break
+# a run. `enabled` defaults on: with no keys exported the chain is empty and we
+# fall back to deterministic-only anyway, so it is safe. Set enabled=false in
+# scout.json to hard-disable the model layer.
+DEFAULT_SCOUT = {
+    "enabled": True,
+    "max_leads_per_triage": 8,
+    "request_timeout": 20,
+}
+
+
+def load_scout_cfg() -> dict:
+    """scout.json merged over code defaults -> always a usable config."""
+    return {**DEFAULT_SCOUT, **load_json(SCOUT_FILE)}
+
 # High-signal substrings that turn a line into an "anomaly" lead outright.
 ANOMALY_SIGNALS = [
     ("traceback (most recent call last)", "python stack trace leaked"),
@@ -157,40 +189,60 @@ def deterministic_extract(cmd: str, stdout: str, stderr: str, pointer_id: str) -
     return leads
 
 
-def scout_rank(candidates: list, scout_cfg: dict) -> dict:
-    """
-    Optional cheap-model pass. Sends ONLY the compact candidate list (never the
-    raw log) and asks for a ranking. Returns {value: {confidence, suggested_next}}.
-    Fails silent -> deterministic leads stand on their own.
-    """
+SCOUT_SYSTEM_PROMPT = (
+    "You are a penetration-testing triage scout. Given discovered items from a "
+    "scan, return ONLY a compact JSON array. Each element: "
+    '{"value": <the item value verbatim>, "confidence": <0.0-1.0 how likely '
+    'this leads to a real vuln>, "suggested_next": <one concrete next test, '
+    "terse>}. No prose, no markdown fences."
+)
+
+
+def _provider_chain(scout_cfg: dict) -> list:
+    """Ordered providers to try. Built from, in order:
+      1. the explicit primary in scout.json (base_url/model), then its 'fallbacks';
+      2. any KNOWN_PROVIDERS whose API key is exported but that config omitted.
+    De-duplicated by (base_url, model), so an old scout.json still gets the full
+    Groq -> OpenRouter chain automatically as long as the keys are exported."""
     import os
+
+    chain, seen = [], set()
+
+    def _add(p):
+        if not (isinstance(p, dict) and p.get("base_url") and p.get("model")):
+            return
+        key = (p["base_url"].rstrip("/"), p.get("model"))
+        if key in seen:
+            return
+        seen.add(key)
+        chain.append(p)
+
+    if scout_cfg.get("base_url") and scout_cfg.get("model"):
+        _add({
+            "base_url": scout_cfg.get("base_url"),
+            "model": scout_cfg.get("model"),
+            "api_key_env": scout_cfg.get("api_key_env", ""),
+        })
+    for fb in scout_cfg.get("fallbacks") or []:
+        _add(fb)
+    # Robustness net: activate any known provider whose key is present.
+    for p in KNOWN_PROVIDERS:
+        if os.environ.get(p["api_key_env"]):
+            _add(p)
+    return chain
+
+
+def _query_provider(compact: list, provider: dict, api_key: str, timeout: int) -> dict:
+    """Single OpenAI-compatible chat call. Raises on any transport/parse error
+    (including HTTP 429 rate-limits) so the caller can fall through to the next
+    provider. Returns {value: {confidence, suggested_next}}."""
     import urllib.request
 
-    if not scout_cfg.get("enabled"):
-        return {}
-
-    api_key = os.environ.get(scout_cfg.get("api_key_env", ""), "")
-    base_url = (scout_cfg.get("base_url") or "").rstrip("/")
-    model = scout_cfg.get("model")
-    if not (api_key and base_url and model):
-        return {}
-
-    # Compact payload: type + value + signal only. Keeps request tiny.
-    compact = [
-        {"value": c["value"], "type": c["type"], "signal": c["signal"]}
-        for c in candidates[: scout_cfg.get("max_leads_per_triage", 8)]
-    ]
-    system = (
-        "You are a penetration-testing triage scout. Given discovered items from a "
-        "scan, return ONLY a compact JSON array. Each element: "
-        '{"value": <the item value verbatim>, "confidence": <0.0-1.0 how likely '
-        'this leads to a real vuln>, "suggested_next": <one concrete next test, '
-        "terse>}. No prose, no markdown fences."
-    )
+    base_url = (provider.get("base_url") or "").rstrip("/")
     body = json.dumps({
-        "model": model,
+        "model": provider.get("model"),
         "messages": [
-            {"role": "system", "content": system},
+            {"role": "system", "content": SCOUT_SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(compact)},
         ],
         "temperature": 0.2,
@@ -202,25 +254,59 @@ def scout_rank(candidates: list, scout_cfg: dict) -> dict:
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
-    try:
-        timeout = scout_cfg.get("request_timeout", 20)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-        content = data["choices"][0]["message"]["content"].strip()
-        content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.M).strip()
-        ranked = json.loads(content)
-        out = {}
-        for r in ranked:
-            if isinstance(r, dict) and "value" in r:
-                out[str(r["value"])] = {
-                    "confidence": r.get("confidence"),
-                    "suggested_next": r.get("suggested_next"),
-                }
-        return out
-    except Exception as e:
-        print(f"[!] Scout model skipped ({e}); using deterministic leads only.",
-              file=sys.stderr)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode())
+    content = data["choices"][0]["message"]["content"].strip()
+    content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.M).strip()
+    ranked = json.loads(content)
+    out = {}
+    for r in ranked:
+        if isinstance(r, dict) and "value" in r:
+            out[str(r["value"])] = {
+                "confidence": r.get("confidence"),
+                "suggested_next": r.get("suggested_next"),
+            }
+    return out
+
+
+def scout_rank(candidates: list, scout_cfg: dict) -> dict:
+    """
+    Optional cheap-model pass. Sends ONLY the compact candidate list (never the
+    raw log) and asks for a ranking. Tries the primary provider first, then each
+    'fallbacks' entry in order (e.g. Groq rate-limited -> OpenRouter) until one
+    answers. Returns {value: {confidence, suggested_next}}.
+    Fails silent -> deterministic leads stand on their own.
+    """
+    import os
+
+    if scout_cfg.get("enabled") is False:
         return {}
+
+    # Compact payload: type + value + signal only. Keeps request tiny.
+    compact = [
+        {"value": c["value"], "type": c["type"], "signal": c["signal"]}
+        for c in candidates[: scout_cfg.get("max_leads_per_triage", 8)]
+    ]
+    timeout = scout_cfg.get("request_timeout", 20)
+
+    chain = _provider_chain(scout_cfg)
+    for provider in chain:
+        api_key = os.environ.get(provider.get("api_key_env", ""), "")
+        if not api_key:
+            # No key exported for this provider; quietly skip to the next.
+            continue
+        label = provider.get("model", "?")
+        try:
+            result = _query_provider(compact, provider, api_key, timeout)
+            if result:
+                return result
+            # Reachable but returned nothing usable -> try the next provider.
+        except Exception as e:
+            print(f"[!] Scout provider '{label}' skipped ({e}); trying fallback.",
+                  file=sys.stderr)
+            continue
+
+    return {}
 
 
 def triage_pointer(pointer_id: str):
@@ -238,7 +324,7 @@ def triage_pointer(pointer_id: str):
         return
 
     # Optional cheap-model ranking pass (fails silent).
-    ranked = scout_rank(candidates, load_json(SCOUT_FILE))
+    ranked = scout_rank(candidates, load_scout_cfg())
     for lead in candidates:
         hit = ranked.get(lead["value"])
         if hit:

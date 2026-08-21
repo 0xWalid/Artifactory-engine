@@ -76,17 +76,27 @@ def init_target_workspace(target_dir: Path):
         # operator model never has to read the firehose. Disabled by default;
         # triage still works deterministically (no model calls) until enabled.
         initial_scout = {
-            "enabled": False,
+            "enabled": True,
             "base_url": "https://api.groq.com/openai/v1",
             "model": "llama-3.3-70b-versatile",
             "api_key_env": "GROQ_API_KEY",
+            "fallbacks": [
+                {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": "meta-llama/llama-3.3-70b-instruct:free",
+                    "api_key_env": "OPENROUTER_API_KEY"
+                }
+            ],
             "max_leads_per_triage": 8,
             "request_timeout": 20,
             "_note": (
-                "Set enabled=true and export the key named by api_key_env. "
-                "OpenAI-compatible, so swap base_url/model for OpenRouter "
-                "(https://openrouter.ai/api/v1 + a ':free' model), Cerebras, or "
-                "Gemini's OpenAI endpoint. Deterministic triage runs regardless."
+                "The Groq -> OpenRouter failover chain also lives in the engine "
+                "code (triage.KNOWN_PROVIDERS), so ranking works even if this file "
+                "is deleted or incomplete: just export GROQ_API_KEY and/or "
+                "OPENROUTER_API_KEY. A provider is only used if its api_key_env is "
+                "set; with no keys, deterministic triage runs alone. This file lets "
+                "you override models/order or add providers (Cerebras, Gemini's "
+                "OpenAI endpoint, ...). Set enabled=false to hard-disable the model."
             ),
         }
         scout_file.write_text(json.dumps(initial_scout, indent=2))
