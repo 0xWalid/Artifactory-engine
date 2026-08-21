@@ -34,6 +34,7 @@ chmod +x "$ARTIFACTORY_DIR/sec_flow.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/playbook_engine.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/ingest.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/report_engine.py" 2>/dev/null || true
+chmod +x "$ARTIFACTORY_DIR/triage.py" 2>/dev/null || true
 
 # 4. Register OpenCode command (/artifactory) with auto-reporting on findings
 cat << 'CMD_EOF' > "$OPENCODE_CMD_DIR/artifactory.md"
@@ -74,6 +75,13 @@ You are the Artifactory Security Engine assistant. You execute structured workfl
 6. **Guardrail Responses (never evade):**
    - If a command is refused with `[!] SCOPE ERROR`, `[!] CANARY TRIPWIRE`, or `[!] DESTRUCTIVE-ACTION BLOCK`, treat it as a hard stop. **Do NOT** rewrite, obfuscate, or split the command to get around the guard. Surface the block to the operator, explain why it tripped, and continue with in-bounds techniques.
    - A `CANARY TRIPWIRE HIT` in output means a command reached protected do-not-touch data — halt that line of testing and report it.
+7. **Token Discipline — run heavy work in the background, consume LEADS not raw output:** You are the expensive strategist; do NOT read raw tool output line by line. Let the engine's background Scout digest it for you.
+   - For any slow or high-volume enumeration (port scans, `ffuf`/`gobuster` content discovery, subdomain brute force), launch it detached and keep working:
+     `python3 ~/artifactory/sec_flow.py run --bg --cmd "<command>" --target "<target>"`
+   - The Scout auto-triages every command's output into ranked **leads** on `board.json`. Pull the short ranked list instead of inspecting logs:
+     `python3 ~/artifactory/sec_flow.py leads` (filter with `--status new` / `--type endpoint|port|subdomain|tech|anomaly`).
+   - Work the leads top-down (highest confidence first — `anomaly` leads are near-certain signal). Mark what you act on: `python3 ~/artifactory/sec_flow.py leads --id <LEAD_ID> --set-status testing|confirmed|dead`.
+   - Only `inspect` a raw artifact when a specific lead needs its exact evidence. Think in leads and hypotheses; do just-enough recon to form an attack theory, then pivot to testing — deepen recon in the background as you go, don't front-load it and burn the budget.
 
 ---
 
@@ -83,10 +91,10 @@ You are the Artifactory Security Engine assistant. You execute structured workfl
 - **Phase 1: Workspace Init & Surface Mapping:**
   - Initialize workspace state if missing: `python3 ~/artifactory/init_env.py --target .`
   - **Confirm scope:** ensure `<target>` is authorized in `.blackboard/scope.json` before any run (see Operational Rule 5). If it isn't, stop and get authorization first.
-  - Run initial discovery commands via `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`.
-  - Log discovered endpoints, hosts, and open ports using `sec_flow.py add-asset`.
+  - Run initial discovery commands via `python3 ~/artifactory/sec_flow.py run --cmd "<command>" --target "<target>"`; launch slow/high-volume scans detached with `--bg` so you are never blocked reading output.
+  - The background Scout auto-triages results into ranked **leads** — you don't need to log every asset by hand. Pull the digest with `python3 ~/artifactory/sec_flow.py leads`. Use `add-asset` mainly to record a confirmed finding (which also auto-reports).
 - **Phase 2: Autonomous Pivot to Business Logic & Access Control:**
-  - Do NOT halt after discovery. Inspect mapped assets in `.blackboard/board.json`.
+  - Do NOT halt after discovery. Pull the ranked leads with `python3 ~/artifactory/sec_flow.py leads` and work them top-down (anomaly > port/endpoint > tech).
   - Prioritize testing high-impact, human-logic-prone attack surfaces aligned with the stack (auth bypasses, privilege escalation, IDORs, state tampering).
   - Execute diagnostic checks sequentially via `sec_flow.py run`. If a vector lacks an `.md` playbook, follow the **Tradecraft Synthesis & Confirmation Protocol** below.
   - **Chain & coordinate via the blackboard:** treat `board.json` as shared state — feed each confirmed finding back as a pivot for the next (e.g. a leaked token → auth bypass → IDOR → data reach). Log intermediate assets as you go so later steps can build on them, and prefer chaining discrete findings into a demonstrated end-to-end impact over reporting them in isolation.
@@ -145,6 +153,10 @@ When provided an external writeup link or local text file, route it through the 
 ### 4. `/artifactory report`
 - Manually re-generate or refresh all per-vulnerability markdown reports and evidence logs under `./reports/`:
   `python3 ~/artifactory/report_engine.py`
+
+### Background Scout (optional, token-saving brain)
+- Deterministic triage (endpoints, ports, subdomains, tech, high-signal anomalies) runs automatically and for FREE on every command — no setup needed.
+- For smarter lead ranking, enable the optional Scout model in `.blackboard/scout.json` (`enabled: true`) and export the API key it names. It is OpenAI-compatible and provider-agnostic — point `base_url`/`model` at any free tier (e.g. Groq's high daily limit, or an OpenRouter `:free` model). If it's disabled or unreachable, deterministic leads still populate — the engine never blocks on it.
 CMD_EOF
 
 echo "[+] Registered /artifactory command in $OPENCODE_CMD_DIR/artifactory.md"

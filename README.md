@@ -16,6 +16,7 @@ Instead of dumping massive, raw CLI output into LLM context windows or executing
 | **Command Execution** | Raw, vulnerable `shell=True` execution | **POSIX tokenized subprocess execution** (`shlex.split`, `shell=False`) with a wall-clock timeout, to mitigate injection and hung-tool risks. |
 | **Safety Interlocks** | None | **Canary tripwire** (blocks/flags commands that reach do-not-touch data) and a **destructive-action block** (`rm -r/-f`, `dd`, `mkfs*`, `shutdown`, raw-disk writes, fork bombs) gated on `scope.json` `disallowed_actions`. |
 | **Context Window Control** | Dumps 100+ lines of raw tool output into context | Logs output to `.blackboard/artifacts/` under pointer IDs (`MSG_XXXX`), exposing only 20-line previews and targeted regex/JSON inspection. |
+| **Cognition Split** | One expensive model reads every line of tool output | **Two-tier:** a background **Scout** (deterministic-first + optional free model) digests raw output into ranked **leads**; the operator model consumes the short lead list, not the firehose. Heavy scans run detached (`run --bg`). |
 | **State Persistence** | Transient chat memory | Shared local state (`board.json`) updated via dedicated CLI helpers (`add-asset`) to prevent token waste. |
 | **Reporting** | Manual write-up | Recording a finding auto-triggers `report_engine.py`, compiling a per-vulnerability advisory correlated to the exact commands that proved it. |
 | **Tradecraft Library** | Static or unverified dynamic commands | Parameterized Markdown playbooks in `prompts/` with **human-in-the-loop methodology synthesis** (identify the bug-class authority, request sources, confirm) when a playbook is missing. |
@@ -34,6 +35,7 @@ artifactory-engine/
     ├── playbook_engine.py      <-- Parameterized playbook renderer & methodology-synthesis trigger
     ├── ingest.py               <-- Tradecraft parameterizer, quality-checker & writer
     ├── report_engine.py        <-- Per-finding advisory & evidence-log generator (auto-run on new findings)
+    ├── triage.py               <-- Background triage + Scout brain: raw output -> ranked leads
     └── prompts/                <-- Reusable Tradecraft Playbook Library
         ├── recon/              <-- Discovery & mapping tradecraft
         ├── web/                <-- Web app testing procedures
@@ -142,6 +144,29 @@ Recording a finding auto-compiles a markdown advisory plus an evidence log under
 python3 ~/artifactory/report_engine.py
 
 ```
+
+### Two-Tier Cognition: Background Scout & Ranked Leads
+
+The expensive operator model should make decisions, not read the firehose of tool output. Artifactory splits cognition in two:
+
+* **Operator** (your interactive agent) — consumes only a short, ranked **leads** list and drives strategy/exploitation.
+* **Scout** (background) — digests every command's raw output into leads on `board.json`. It is **deterministic-first** (endpoints, open ports, subdomains, tech banners, and high-signal anomalies like SQL errors or leaked `/etc/passwd` are parsed for free, instantly), with an **optional cheap/free model** for smarter ranking.
+
+Run heavy enumeration detached so nothing blocks, then pull the digest:
+
+```bash
+# Launch a scan in the background (returns immediately; results + leads land on the board when done)
+python3 ~/artifactory/sec_flow.py run --bg --cmd "ffuf -u http://127.0.0.1:8080/FUZZ -w list.txt" --target "127.0.0.1"
+
+# Consume the ranked leads instead of raw logs (anomaly > port/endpoint > tech)
+python3 ~/artifactory/sec_flow.py leads --status new
+
+# Mark a lead as you work it
+python3 ~/artifactory/sec_flow.py leads --id LEAD_ABC123 --set-status testing
+
+```
+
+The **Scout model is optional and provider-agnostic**. Deterministic triage always runs for free; to add model-based ranking, set `enabled: true` in `.blackboard/scout.json` and point its OpenAI-compatible `base_url`/`model` at any free tier (e.g. Groq, or an OpenRouter `:free` model) with the API key it names. If it's disabled or unreachable, leads still populate — the engine never blocks on it.
 
 ### Context-Preserving Log Inspection (`sec_flow.py inspect`)
 
