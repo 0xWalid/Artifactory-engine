@@ -51,7 +51,7 @@ def init_target_workspace(target_dir: Path):
             "allowed_hosts": ["127.0.0.1", "localhost"],
             "allowed_domains": ["*.local.target"],
             "allowed_cidrs": ["127.0.0.0/8"],
-            "disallowed_actions": ["DOS", "DESTRUCTIVE_WRITE", "EXFILTRATE_PII"]
+            "disallowed_actions": ["DESTRUCTIVE_WRITE", "DOS"]
         }
         scope_file.write_text(json.dumps(initial_scope, indent=2))
         print(f"[+] Created: {scope_file.name}")

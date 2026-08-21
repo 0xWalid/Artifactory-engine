@@ -60,18 +60,51 @@ def check_or_fetch_playbook(category: str, name: str, target: str = "", auth_tok
         rendered_content = render_playbook(raw_content, target, auth_token)
         return target_path, rendered_content, True
 
-    # Signal to OpenCode that tradecraft must be synthesized/researched
+    # Signal to the agent that tradecraft must be synthesized into a real
+    # testing methodology (not just a raw command list) before proceeding.
     research_prompt = f"""[STATUS: MISSING_NEEDS_RESEARCH]
-Playbook not found at: {target_path}
+No playbook found at: {target_path}
 Category: {category}
-Vulnerability/Vector: {name}
+Vulnerability / Vector: {name}
 
-ACTION REQUIRED:
-1. Search industry sources (OWASP WSTG, PortSwigger Web Security, CVE advisories) for '{name}' targeting '{category}'.
-2. Extract concrete, non-destructive diagnostic CLI commands (curl, httpx, ffuf) and response indicators.
-3. Save the tradecraft via:
-   python3 ~/artifactory/playbook_engine.py --category {category} --name {name} --save-content "<content>"
-4. Re-execute the test.
+You must now SYNTHESIZE A TESTING METHODOLOGY for this vector before any command
+runs. Do not emit ad-hoc commands. Follow this protocol in order:
+
+1. IDENTIFY THE AUTHORITY FOR THIS BUG CLASS.
+   Name the practitioner(s) / research most associated with '{name}' and pull
+   from their primary material. Map the class to the right source, e.g.:
+     - web / request smuggling / cache / SSRF ...... James Kettle, PortSwigger Research
+     - recon / attack surface / methodology ......... Jason Haddix, TBHM
+     - logic / SSRF / cloud / OAuth ................. Orange Tsai, Frans Rosen
+     - infra / cloud .................................. relevant CVE + vendor advisories
+   Always cross-check against OWASP WSTG and any relevant CVE advisories.
+   Retain the source link(s) — they are recorded with the playbook.
+
+2. REQUEST MORE INPUT FROM THE OPERATOR (do this explicitly, then WAIT):
+   ❓ Provide any of the following to sharpen the methodology:
+      - Additional writeup / advisory URLs to fold in
+      - Local files (writeups, prior reports, Burp/HTTP logs) to ingest
+      - Custom payloads, headers, or auth material specific to the target
+      - Scope notes or constraints (rate limits, approved aggressive techniques)
+   If the operator has nothing to add, they should say "proceed".
+
+3. SYNTHESIZE A STRUCTURED METHODOLOGY (parameterized, non-destructive):
+   Compose the playbook body with these sections, using the template variables
+   {{{{TARGET_URL}}}}, {{{{TARGET_HOST}}}}, {{{{AUTH_TOKEN}}}} instead of live values:
+      ## Preconditions & Indicators   (when this vuln is plausible)
+      ## Enumeration                  (how to confirm the surface exists)
+      ## Diagnostic Checks            (concrete curl/httpx/ffuf commands, safe/non-destructive)
+      ## Verification & Impact        (response signatures that confirm the finding)
+      ## Escalation & Chaining        (how this links into a larger attack path)
+
+4. CONFIRMATION GATE (MANDATORY PAUSE):
+   Present the summary card (name, practitioner, source links, category, key
+   steps) and PAUSE for operator approval before writing anything.
+
+5. SAVE & EXECUTE (only after approval):
+   python3 ~/artifactory/playbook_engine.py --category {category} --name {name} \\
+     --author "<Practitioner / Source>" --save-content "<synthesized_markdown>"
+   Then re-run the test against the target via sec_flow.py run.
 """
     return target_path, research_prompt, False
 

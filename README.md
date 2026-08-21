@@ -12,11 +12,13 @@ Instead of dumping massive, raw CLI output into LLM context windows or executing
 
 | Capability | Standard AI Agent Prompting | Artifactory SBA Pipeline |
 | --- | --- | --- |
-| **Scope Enforcement** | Relies purely on system prompt compliance | **Hard-gated local checks** (`sec_flow.py`) matching hosts, domains, and CIDR subnets against `scope.json`. |
-| **Command Execution** | Raw, vulnerable `shell=True` execution | **POSIX tokenized subprocess execution** (`shlex.split`, `shell=False`) to mitigate injection risks. |
+| **Scope Enforcement** | Relies purely on system prompt compliance | **Fail-closed, hard-gated local checks** (`sec_flow.py`): an empty/missing `scope.json` grants nothing, and every command requires an explicit in-scope `--target` matched against hosts, domains, and CIDR subnets. |
+| **Command Execution** | Raw, vulnerable `shell=True` execution | **POSIX tokenized subprocess execution** (`shlex.split`, `shell=False`) with a wall-clock timeout, to mitigate injection and hung-tool risks. |
+| **Safety Interlocks** | None | **Canary tripwire** (blocks/flags commands that reach do-not-touch data) and a **destructive-action block** (`rm -r/-f`, `dd`, `mkfs*`, `shutdown`, raw-disk writes, fork bombs) gated on `scope.json` `disallowed_actions`. |
 | **Context Window Control** | Dumps 100+ lines of raw tool output into context | Logs output to `.blackboard/artifacts/` under pointer IDs (`MSG_XXXX`), exposing only 20-line previews and targeted regex/JSON inspection. |
 | **State Persistence** | Transient chat memory | Shared local state (`board.json`) updated via dedicated CLI helpers (`add-asset`) to prevent token waste. |
-| **Tradecraft Library** | Static or unverified dynamic commands | Parameterized Markdown playbooks in `prompts/` with **Autonomous Research Synthesis** when playbooks are missing. |
+| **Reporting** | Manual write-up | Recording a finding auto-triggers `report_engine.py`, compiling a per-vulnerability advisory correlated to the exact commands that proved it. |
+| **Tradecraft Library** | Static or unverified dynamic commands | Parameterized Markdown playbooks in `prompts/` with **human-in-the-loop methodology synthesis** (identify the bug-class authority, request sources, confirm) when a playbook is missing. |
 
 ---
 
@@ -27,10 +29,11 @@ artifactory-engine/
 ├── install.sh                  <-- Automated installer & OpenCode slash-command setup
 ├── README.md                   <-- Documentation
 └── artifactory/                <-- Core Engine Pipeline
-    ├── init_env.py             <-- Workspace initializer (creates .blackboard/, schemas, scope)
-    ├── sec_flow.py             <-- Safe runner, CIDR gate, log inspection & asset tracker
-    ├── playbook_engine.py      <-- Parameterized playbook renderer & research trigger
+    ├── init_env.py             <-- Workspace initializer (creates .blackboard/, schemas, scope, canary)
+    ├── sec_flow.py             <-- Safe runner, fail-closed scope gate, canary + destructive guards, log inspection & asset tracker
+    ├── playbook_engine.py      <-- Parameterized playbook renderer & methodology-synthesis trigger
     ├── ingest.py               <-- Tradecraft parameterizer, quality-checker & writer
+    ├── report_engine.py        <-- Per-finding advisory & evidence-log generator (auto-run on new findings)
     └── prompts/                <-- Reusable Tradecraft Playbook Library
         ├── recon/              <-- Discovery & mapping tradecraft
         ├── web/                <-- Web app testing procedures
@@ -46,8 +49,8 @@ artifactory-engine/
 ## 🚀 Installation & Setup
 
 ```bash
-git clone https://github.com/0xWalid/artifactory-engine.git
-cd artifactory-engine
+git clone https://github.com/0xWalid/Artifactory-engine.git
+cd Artifactory-engine
 chmod +x install.sh
 ./install.sh
 
@@ -55,10 +58,13 @@ chmod +x install.sh
 
 ### What `install.sh` Does:
 
-1. Creates a path symlink: `~/artifactory` -> `artifactory-engine/artifactory`.
+1. Creates a path symlink: `~/artifactory` -> `Artifactory-engine/artifactory` (so the engine code runs live from the repo).
 2. Creates the prompt category directories and local storage paths.
-3. Sets execution permissions across all core Python scripts (`init_env.py`, `sec_flow.py`, `playbook_engine.py`, `ingest.py`).
+3. Sets execution permissions across all core Python scripts (`init_env.py`, `sec_flow.py`, `playbook_engine.py`, `ingest.py`, `report_engine.py`).
 4. Registers the `/artifactory` custom command under `~/.config/opencode/commands/artifactory.md`.
+5. Checks for optional external tools (`python3`, `git`, `semgrep`, `nmap`, `httpx`, `ffuf`) — it reports which are missing but does **not** install them.
+
+> **Note:** The Python engine runs live through the symlink, so editing a `.py` file takes effect immediately. The `/artifactory` command doc is a **copy**, so after changing it (or `install.sh`) you must re-run `./install.sh` to refresh it.
 
 ---
 
@@ -87,7 +93,7 @@ Run `opencode` inside any target workspace directory and invoke the engine on de
 ```
 
 * **Parameter Rendering:** Loads `prompts/<category>/<vulnerability>.md` and substitutes dynamic target variables (`{{TARGET_URL}}`, `{{TARGET_HOST}}`, `{{AUTH_TOKEN}}`).
-* **Autonomous Fallback:** If the playbook does not exist (`[STATUS: MISSING_NEEDS_RESEARCH]`), the agent automatically queries standard references (OWASP WSTG, PortSwigger, CVE advisories), extracts non-destructive test steps, saves the playbook via `ingest.py`, and immediately runs the test.
+* **Methodology Synthesis (human-in-the-loop):** If the playbook does not exist (`[STATUS: MISSING_NEEDS_RESEARCH]`), the agent follows a structured directive: identify the authority for the bug class (e.g. James Kettle/PortSwigger, Orange Tsai, Jason Haddix), **request additional writeup URLs, files, and payloads from the operator and pause**, synthesize a sectioned parameterized methodology (Preconditions → Enumeration → Diagnostic Checks → Verification & Impact → Escalation & Chaining), present a confirmation card, and only then save it via `playbook_engine.py --save-content` and run the test.
 * **Safe Execution:** Runs diagnostic commands via `sec_flow.py run` and logs findings to `.blackboard/board.json`.
 
 ---
@@ -109,10 +115,31 @@ Run `opencode` inside any target workspace directory and invoke the engine on de
 
 ### Scope Enforcement & Safe Execution (`sec_flow.py run`)
 
-Validates domains, hosts, and IP subnets before executing commands:
+Fail-closed: a missing/empty `scope.json` permits nothing, and every command must declare an in-scope `--target`. Validates domains, hosts, and IP subnets (with DNS resolution) before executing:
 
 ```bash
 python3 ~/artifactory/sec_flow.py run --cmd "curl -s http://127.0.0.1:8080" --target "127.0.0.1"
+
+```
+
+Three hard interlocks are enforced in the runner, and refusals are surfaced (never silently bypassed):
+
+* **`[!] SCOPE ERROR`** — target not authorized in `.blackboard/scope.json`.
+* **`[!] CANARY TRIPWIRE`** — a command references the workspace canary token (do-not-touch data); a post-run scan also flags `CANARY TRIPWIRE HIT` and logs it if the token appears in output.
+* **`[!] DESTRUCTIVE-ACTION BLOCK`** — irreversible host/data destruction (`rm -r/-f`, `dd`, `mkfs*`, `shutdown`/`reboot`, raw-disk writes, fork bombs), gated on `DESTRUCTIVE_WRITE` in `scope.json` `disallowed_actions`.
+
+Every command also runs under a wall-clock timeout so a hung tool cannot stall the engine.
+
+### Operating Policy (authorized targets only)
+
+Artifactory is for testing **targets you are authorized to assess**. Within an in-scope engagement, aggressive-but-legal tradecraft is in play (rate-limited brute force, old-backup/source review, feature-logic bypass, and novel techniques synthesized as needed), and proof-of-concept data retrieval is permitted when a test incidentally proves impact. Availability/DoS-class bugs may be **discovered and minimally proven**, but deliberate sustained flooding is out of scope. The host/CIDR scope gate and the destructive-action block are the hard boundaries.
+
+### Automated Per-Finding Reporting (`report_engine.py`)
+
+Recording a finding auto-compiles a markdown advisory plus an evidence log under `./reports/`, correlated to the exact pointer IDs that proved it. Regenerate manually with:
+
+```bash
+python3 ~/artifactory/report_engine.py
 
 ```
 
