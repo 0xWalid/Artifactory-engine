@@ -18,12 +18,23 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Shared, lock-serialised blackboard I/O (prevents parallel-agent write races).
+_engine_dir = str(Path(__file__).resolve().parent)
+if _engine_dir not in sys.path:
+    sys.path.insert(0, _engine_dir)
+from board_io import json_transaction  # noqa: E402
+
 BLACKBOARD_DIR = Path.cwd() / ".blackboard"
 ARTIFACTS_DIR = BLACKBOARD_DIR / "artifacts"
 HISTORY_FILE = BLACKBOARD_DIR / "history.log"
 SCOPE_FILE = BLACKBOARD_DIR / "scope.json"
 BOARD_FILE = BLACKBOARD_DIR / "board.json"
 CANARY_FILE = BLACKBOARD_DIR / "canaries.json"
+RATIONALE_FILE = BLACKBOARD_DIR / "rationale.jsonl"
+
+# Finding severity/status vocabularies (WS1: verification gate).
+SEVERITIES = ["info", "low", "medium", "high", "critical"]
+FINDING_STATUSES = ["informational", "confirmed"]
 
 # Wall-clock ceiling for any single diagnostic command so a hung tool cannot
 # stall the engine indefinitely.
@@ -83,24 +94,107 @@ def is_target_in_scope(target: str, scope: dict) -> bool:
     return False
 
 
+def clean_host(target: str) -> str:
+    return target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+
+
+def matches_authorized_domain(host: str, scope: dict) -> bool:
+    """True if host falls under an authorized apex/wildcard in allowed_domains."""
+    for domain in scope.get("allowed_domains", []):
+        domain_clean = domain.replace("*.", "")
+        if host == domain_clean or host.endswith("." + domain_clean):
+            return True
+    return False
+
+
+def classify_and_expand_scope(host: str) -> str:
+    """WS2: decide how a newly-discovered host enters scope.
+
+    - Already in scope (host/cidr/domain) or under an authorized wildcard ->
+      materialise it in `allowed_hosts` and mark 'authorized'.
+    - Otherwise -> queue in `pending_scope` for explicit operator approval.
+    Never silently authorises a host that is not under an approved domain.
+    Returns one of: 'authorized' | 'pending' | 'noop'.
+    """
+    host = clean_host(host)
+    if not host:
+        return "noop"
+
+    outcome = "noop"
+    with json_transaction("scope.json", create=True) as scope:
+        allowed_hosts = scope.setdefault("allowed_hosts", [])
+        pending = scope.setdefault("pending_scope", [])
+
+        if matches_authorized_domain(host, scope):
+            if host not in allowed_hosts:
+                allowed_hosts.append(host)
+            if host in pending:
+                pending.remove(host)
+            outcome = "authorized"
+        elif host in allowed_hosts:
+            outcome = "authorized"
+        else:
+            if host not in pending:
+                pending.append(host)
+            outcome = "pending"
+    return outcome
+
+
+def manage_scope(add_host=None, add_domain=None, add_cidr=None, approve=None, do_list=False):
+    """WS2: operator-facing scope editing + per-project visibility."""
+    if not SCOPE_FILE.exists():
+        print(f"[!] Error: {SCOPE_FILE} not found. Run init_env.py first.", file=sys.stderr)
+        sys.exit(1)
+
+    if do_list and not any([add_host, add_domain, add_cidr, approve]):
+        scope = load_json(SCOPE_FILE)
+        print("[*] Current scope:")
+        print(f"    allowed_hosts:   {scope.get('allowed_hosts', [])}")
+        print(f"    allowed_domains: {scope.get('allowed_domains', [])}")
+        print(f"    allowed_cidrs:   {scope.get('allowed_cidrs', [])}")
+        print(f"    pending_scope:   {scope.get('pending_scope', [])}  (awaiting --approve)")
+        return
+
+    with json_transaction("scope.json", create=True) as scope:
+        allowed_hosts = scope.setdefault("allowed_hosts", [])
+        allowed_domains = scope.setdefault("allowed_domains", [])
+        allowed_cidrs = scope.setdefault("allowed_cidrs", [])
+        pending = scope.setdefault("pending_scope", [])
+
+        if add_host and add_host not in allowed_hosts:
+            allowed_hosts.append(add_host)
+            print(f"[✔] Added host to scope: {add_host}")
+        if add_domain and add_domain not in allowed_domains:
+            allowed_domains.append(add_domain)
+            print(f"[✔] Added domain to scope: {add_domain}")
+        if add_cidr and add_cidr not in allowed_cidrs:
+            allowed_cidrs.append(add_cidr)
+            print(f"[✔] Added CIDR to scope: {add_cidr}")
+        if approve:
+            host = clean_host(approve)
+            if host in pending:
+                pending.remove(host)
+            if host not in allowed_hosts:
+                allowed_hosts.append(host)
+            print(f"[✔] Approved into scope: {host}")
+
+
 def update_board_state(pointer_id: str, cmd: str, returncode: int, summary: str = ""):
     if not BOARD_FILE.exists():
         return
 
     try:
-        board_data = load_json(BOARD_FILE)
-        board_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-        
-        pointer_entry = {
-            "pointer_id": pointer_id,
-            "command": cmd,
-            "return_code": returncode,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "summary": summary
-        }
-        
-        board_data.setdefault("execution_log_pointers", []).append(pointer_entry)
-        BOARD_FILE.write_text(json.dumps(board_data, indent=2))
+        with json_transaction("board.json") as board_data:
+            if board_data is None:
+                return
+            pointer_entry = {
+                "pointer_id": pointer_id,
+                "command": cmd,
+                "return_code": returncode,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "summary": summary,
+            }
+            board_data.setdefault("execution_log_pointers", []).append(pointer_entry)
     except Exception as e:
         print(f"[!] Warning: Could not update board.json: {e}", file=sys.stderr)
 
@@ -137,61 +231,136 @@ def trigger_triage(pointer_id: str):
         print(f"[!] Warning: triage pass failed: {e}", file=sys.stderr)
 
 
-def add_asset_to_board(host: str = None, endpoint: str = None, port: str = None, finding: str = None, details: str = ""):
+def _resolve_evidence(poc: str, evidence_from):
+    """Returns (evidence_text, evidence_pointer, has_evidence)."""
+    evidence_text = poc or ""
+    evidence_pointer = None
+    if evidence_from:
+        art = ARTIFACTS_DIR / f"{evidence_from}.log"
+        if art.exists():
+            evidence_pointer = evidence_from
+        else:
+            print(f"[!] Warning: evidence pointer '{evidence_from}' has no artifact "
+                  f"log; ignoring it.", file=sys.stderr)
+    has_evidence = bool(evidence_text) or bool(evidence_pointer)
+    return evidence_text, evidence_pointer, has_evidence
+
+
+def add_asset_to_board(host: str = None, endpoint: str = None, port: str = None,
+                       finding: str = None, details: str = "", severity: str = "info",
+                       status: str = "informational", poc: str = "", evidence_from=None):
     if not BOARD_FILE.exists():
         print(f"[!] Error: {BOARD_FILE} not found. Run init_env.py first.", file=sys.stderr)
         sys.exit(1)
 
+    # Verification gate (WS1): a finding may only be 'confirmed' when it carries
+    # evidence (an inline PoC or a real execution-pointer artifact). Otherwise it
+    # is downgraded to 'informational' so unverified observations never masquerade
+    # as confirmed vulnerabilities.
+    evidence_text, evidence_pointer, has_evidence = ("", None, False)
+    if finding:
+        if severity not in SEVERITIES:
+            severity = "info"
+        if status not in FINDING_STATUSES:
+            status = "informational"
+        evidence_text, evidence_pointer, has_evidence = _resolve_evidence(poc, evidence_from)
+        if status == "confirmed" and not has_evidence:
+            status = "informational"
+            print("[!] VERIFICATION GATE: no PoC/evidence supplied — filed as "
+                  "'informational', NOT 'confirmed'. Run the proving command, then "
+                  "log with --poc \"<payload/request+response>\" or "
+                  "--evidence-from <POINTER_ID>.", file=sys.stderr)
+
     try:
-        board_data = load_json(BOARD_FILE)
-        board_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-        
-        assets = board_data.setdefault("discovered_assets", {"hosts": [], "endpoints": [], "open_ports": []})
-        findings_list = board_data.setdefault("findings", [])
-
         added = []
-        if host and host not in assets.setdefault("hosts", []):
-            assets["hosts"].append(host)
-            added.append(f"Host: {host}")
+        with json_transaction("board.json") as board_data:
+            if board_data is None:
+                print(f"[!] Error: {BOARD_FILE} not found. Run init_env.py first.", file=sys.stderr)
+                sys.exit(1)
 
-        if endpoint and endpoint not in assets.setdefault("endpoints", []):
-            assets["endpoints"].append(endpoint)
-            added.append(f"Endpoint: {endpoint}")
+            assets = board_data.setdefault("discovered_assets", {"hosts": [], "endpoints": [], "open_ports": []})
+            findings_list = board_data.setdefault("findings", [])
 
-        if port and port not in assets.setdefault("open_ports", []):
-            assets["open_ports"].append(port)
-            added.append(f"Port: {port}")
+            if host and host not in assets.setdefault("hosts", []):
+                assets["hosts"].append(host)
+                added.append(f"Host: {host}")
 
-        if finding:
-            # Attach the most recent execution pointers so the report engine can
-            # correlate THIS finding to the commands that actually produced it,
-            # rather than dumping every command into every advisory.
-            recent_pointers = [
-                p.get("pointer_id")
-                for p in board_data.get("execution_log_pointers", [])[-3:]
-                if p.get("pointer_id")
-            ]
-            entry = {
-                "id": f"FINDING_{uuid.uuid4().hex[:6].upper()}",
-                "title": finding,
-                "details": details,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "related_pointers": recent_pointers,
-            }
-            findings_list.append(entry)
-            added.append(f"Finding: {finding}")
+            if endpoint and endpoint not in assets.setdefault("endpoints", []):
+                assets["endpoints"].append(endpoint)
+                added.append(f"Endpoint: {endpoint}")
 
-        BOARD_FILE.write_text(json.dumps(board_data, indent=2))
+            if port and port not in assets.setdefault("open_ports", []):
+                assets["open_ports"].append(port)
+                added.append(f"Port: {port}")
+
+            if finding:
+                # Attach the most recent execution pointers so the report engine can
+                # correlate THIS finding to the commands that produced it. Ensure the
+                # explicit evidence pointer is included.
+                recent_pointers = [
+                    p.get("pointer_id")
+                    for p in board_data.get("execution_log_pointers", [])[-3:]
+                    if p.get("pointer_id")
+                ]
+                if evidence_pointer and evidence_pointer not in recent_pointers:
+                    recent_pointers.append(evidence_pointer)
+                entry = {
+                    "id": f"FINDING_{uuid.uuid4().hex[:6].upper()}",
+                    "title": finding,
+                    "details": details,
+                    "severity": severity,
+                    "status": status,
+                    "evidence": evidence_text,
+                    "evidence_pointer": evidence_pointer,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "related_pointers": recent_pointers,
+                }
+                findings_list.append(entry)
+                added.append(f"Finding[{status}/{severity}]: {finding}")
+
         print(f"[✔] Blackboard updated: {', '.join(added) if added else 'No new entries'}")
+
+        # WS2: a discovered host is classified against scope (auto-authorise under
+        # an approved wildcard, else queue as pending).
+        if host:
+            outcome = classify_and_expand_scope(host)
+            if outcome == "authorized":
+                print(f"[✔] Scope: '{clean_host(host)}' is under an approved domain — added to allowed_hosts.")
+            elif outcome == "pending":
+                print(f"[!] Scope: '{clean_host(host)}' is NOT under an approved domain — "
+                      f"queued in pending_scope. Approve with: "
+                      f"sec_flow.py scope --approve {clean_host(host)}")
 
         # Auto-trigger the report engine when a finding is recorded so advisories
         # and evidence logs stay in sync (as documented in the /artifactory command).
         if finding:
             trigger_report_generation()
 
+    except SystemExit:
+        raise
     except Exception as e:
         print(f"[!] Error updating assets in board.json: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def add_rationale(lead=None, hypothesis="", why="", action="", expected="",
+                  pointer=None, outcome=""):
+    """WS7: append one decision-journal record explaining *why* an action was
+    taken and *what* resulted. Feeds the report's 'How we got here' section."""
+    ensure_blackboard_dirs()
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "lead_id": lead,
+        "hypothesis": hypothesis,
+        "why_chosen": why,
+        "action": action,
+        "expected_signal": expected,
+        "pointer_id": pointer,
+        "outcome": outcome,
+    }
+    with open(RATIONALE_FILE, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    print(f"[✔] Rationale logged{f' for {lead}' if lead else ''}.")
 
 
 def load_canary_token() -> str:
@@ -410,17 +579,19 @@ def show_leads(status: str = None, ltype: str = None, limit: int = 20,
 
     # Mutation mode: update a single lead's status.
     if lead_id and set_status:
-        found = False
-        for l in leads:
-            if l.get("id") == lead_id:
-                l["status"] = set_status
-                found = True
-                break
-        if not found:
-            print(f"[!] Lead '{lead_id}' not found.", file=sys.stderr)
-            sys.exit(1)
-        board["updated_at"] = datetime.now(timezone.utc).isoformat()
-        BOARD_FILE.write_text(json.dumps(board, indent=2))
+        with json_transaction("board.json") as board:
+            if board is None:
+                print(f"[!] Error: {BOARD_FILE} not found. Run init_env.py first.", file=sys.stderr)
+                sys.exit(1)
+            found = False
+            for l in board.get("leads", []):
+                if l.get("id") == lead_id:
+                    l["status"] = set_status
+                    found = True
+                    break
+            if not found:
+                print(f"[!] Lead '{lead_id}' not found.", file=sys.stderr)
+                sys.exit(1)
         print(f"[✔] Lead {lead_id} -> status '{set_status}'")
         return
 
@@ -524,6 +695,32 @@ if __name__ == "__main__":
     asset_parser.add_argument("--port", help="Discovered open port (e.g., 8080/tcp)")
     asset_parser.add_argument("--finding", help="Vulnerability or observation title")
     asset_parser.add_argument("--details", default="", help="Short description of the finding")
+    asset_parser.add_argument("--severity", default="info", choices=SEVERITIES,
+                              help="Finding severity (default: info)")
+    asset_parser.add_argument("--status", default="informational", choices=FINDING_STATUSES,
+                              help="informational (default) or confirmed (requires evidence)")
+    asset_parser.add_argument("--poc", default="",
+                              help="Inline proof: the payload / request+response that proves impact")
+    asset_parser.add_argument("--evidence-from", dest="evidence_from",
+                              help="Pointer ID whose artifact log is the evidence for this finding")
+
+    # scope (WS2: per-project scope + subdomain approval)
+    scope_parser = subparsers.add_parser("scope", help="View or edit engagement scope")
+    scope_parser.add_argument("--list", dest="do_list", action="store_true", help="Show current scope + pending")
+    scope_parser.add_argument("--add-host", dest="add_host", help="Authorise a host/IP")
+    scope_parser.add_argument("--add-domain", dest="add_domain", help="Authorise a domain/wildcard (e.g. *.example.com)")
+    scope_parser.add_argument("--add-cidr", dest="add_cidr", help="Authorise a CIDR range")
+    scope_parser.add_argument("--approve", help="Promote a pending host into allowed_hosts")
+
+    # add-rationale (WS7: decision journal -> 'How we got here')
+    rat_parser = subparsers.add_parser("add-rationale", help="Log why an action was taken and its outcome")
+    rat_parser.add_argument("--lead", help="Lead ID this decision relates to")
+    rat_parser.add_argument("--hypothesis", default="", help="The attack theory being tested")
+    rat_parser.add_argument("--why", default="", help="Why this action was chosen")
+    rat_parser.add_argument("--action", default="", help="What was done")
+    rat_parser.add_argument("--expected", default="", help="Signal that would confirm the hypothesis")
+    rat_parser.add_argument("--pointer", help="Related execution pointer ID")
+    rat_parser.add_argument("--outcome", default="", help="What actually happened (confirmed|dead|inconclusive + note)")
 
     # leads (operator-facing: consume ranked leads instead of raw logs)
     leads_parser = subparsers.add_parser("leads", help="Show/triage ranked leads on the board")
@@ -542,6 +739,12 @@ if __name__ == "__main__":
     elif args.subcommand == "inspect":
         inspect_artifact(args.id, args.grep, args.json_key, args.lines)
     elif args.subcommand == "add-asset":
-        add_asset_to_board(args.host, args.endpoint, args.port, args.finding, args.details)
+        add_asset_to_board(args.host, args.endpoint, args.port, args.finding, args.details,
+                           args.severity, args.status, args.poc, args.evidence_from)
+    elif args.subcommand == "scope":
+        manage_scope(args.add_host, args.add_domain, args.add_cidr, args.approve, args.do_list)
+    elif args.subcommand == "add-rationale":
+        add_rationale(args.lead, args.hypothesis, args.why, args.action, args.expected,
+                      args.pointer, args.outcome)
     elif args.subcommand == "leads":
         show_leads(args.status, args.ltype, args.limit, args.lead_id, args.set_status)

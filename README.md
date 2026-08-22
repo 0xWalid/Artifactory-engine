@@ -145,6 +145,50 @@ python3 ~/artifactory/report_engine.py
 
 ```
 
+### Verification Gate: Confirmed Vulnerabilities vs. Informational Observations
+
+A finding is **`informational` by default** and only becomes a **`confirmed` vulnerability** when it carries evidence — an inline PoC or a real execution-pointer artifact. Unproven observations (a version banner, a "maybe-CVE") are never presented as vulnerabilities and generate no advisory. This is the primary defense against false positives.
+
+```bash
+# Prove it first, then log the confirmed finding WITH its evidence:
+python3 ~/artifactory/sec_flow.py add-asset --finding "Auth bypass on /admin" \
+  --severity high --status confirmed --evidence-from MSG_ABCD1234 \
+  --poc "GET /admin with X-Forwarded-For: 127.0.0.1 -> 200 + admin panel"
+```
+
+Leads flagged `must_verify` by the Scout (tech/version banners → potential CVE, high-signal anomalies) must be actively tested and turned into a PoC before they can be confirmed. Only confirmed findings become advisories; informational items are listed separately in `reports/SUMMARY.md`.
+
+### Per-Project Scope & Gated Subdomain Expansion
+
+Scope is per workspace. Reuse an approved scope across engagements with `init_env.py --target . --scope-from <saved-scope.json>`. Discovered subdomains are **not auto-trusted**: a host under an already-authorized apex/wildcard is auto-added to `allowed_hosts`; anything else is queued in `pending_scope` until you approve it.
+
+```bash
+python3 ~/artifactory/sec_flow.py scope --add-domain "*.example.com"   # authorize a wildcard
+python3 ~/artifactory/sec_flow.py scope --list                        # view scope + pending
+python3 ~/artifactory/sec_flow.py scope --approve staging.acme.com     # promote a pending host
+```
+
+### Multi-Agent Roles & the Decision Journal
+
+The engine runs as a team over the shared blackboard (writes are OS-lock-serialised, so parallel agents can't corrupt state). OpenCode subagents are installed to `~/.config/opencode/agents/`:
+
+* **Orchestrator** (primary) — strategy, works leads, decides what gets confirmed.
+* **`recon`** (background) — passive-first, trigger-based discovery; feeds leads, logs nothing.
+* **`exploit`** — tests one hypothesis, captures the proving pointer/PoC.
+* **`verifier`** — confirms true-positives from evidence and writes the advisory.
+
+Every action can be journaled so the report explains *why it did what and how each result was reached*:
+
+```bash
+python3 ~/artifactory/sec_flow.py add-rationale --lead LEAD_AB12CD \
+  --hypothesis "old Apache -> CVE-2021-41773" --why "Server banner matched" \
+  --action "path-traversal probe" --pointer MSG_ABCD1234 --outcome confirmed
+```
+
+### Auditable Learning Loop & Harness
+
+Artifactory runs on **OpenCode** and stays harness-agnostic — all logic lives in the Python engine, so the multi-agent roles are just swappable subagent definitions. [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) is the intended v2 target once it exits developer preview; its "everything is a plugin" model and append-only trajectory log fit a security engine well. The learning loop is deliberately **auditable, not silent**: worked techniques are distilled into versioned, human-approved playbooks via `ingest.py` (a git diff you can read and revert), and the decision journal records the reasoning behind every run.
+
 ### Two-Tier Cognition: Background Scout & Ranked Leads
 
 The expensive operator model should make decisions, not read the firehose of tool output. Artifactory splits cognition in two:

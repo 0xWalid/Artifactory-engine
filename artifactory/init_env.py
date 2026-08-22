@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def init_target_workspace(target_dir: Path):
+def init_target_workspace(target_dir: Path, scope_from: Path = None):
     """Initializes a local, isolated .blackboard workspace with formal state schemas."""
     target_dir = target_dir.resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -49,12 +49,27 @@ def init_target_workspace(target_dir: Path):
         print(f"[*] Exists (Skipped): {board_file.name}")
 
     if not scope_file.exists():
-        initial_scope = {
-            "allowed_hosts": ["127.0.0.1", "localhost"],
-            "allowed_domains": ["*.local.target"],
-            "allowed_cidrs": ["127.0.0.0/8"],
-            "disallowed_actions": ["DESTRUCTIVE_WRITE", "DOS"]
-        }
+        # Per-project scope. Seed from a saved template (--scope-from) so a new
+        # engagement can inherit an approved scope instead of the localhost default.
+        if scope_from and Path(scope_from).exists():
+            try:
+                initial_scope = json.loads(Path(scope_from).read_text())
+                initial_scope.setdefault("pending_scope", [])
+                print(f"[+] Seeded scope from template: {scope_from}")
+            except Exception as e:
+                print(f"[!] Could not read --scope-from ({e}); using localhost default.")
+                initial_scope = None
+        else:
+            initial_scope = None
+
+        if initial_scope is None:
+            initial_scope = {
+                "allowed_hosts": ["127.0.0.1", "localhost"],
+                "allowed_domains": ["*.local.target"],
+                "allowed_cidrs": ["127.0.0.0/8"],
+                "pending_scope": [],
+                "disallowed_actions": ["DESTRUCTIVE_WRITE", "DOS"]
+            }
         scope_file.write_text(json.dumps(initial_scope, indent=2))
         print(f"[+] Created: {scope_file.name}")
     else:
@@ -116,6 +131,12 @@ if __name__ == "__main__":
         default=".",
         help="Path to target project directory (default: current directory)"
     )
+    parser.add_argument(
+        "--scope-from",
+        type=str,
+        default=None,
+        help="Path to a saved scope.json template to seed this workspace's scope"
+    )
     args = parser.parse_args()
 
-    init_target_workspace(Path(args.target))
+    init_target_workspace(Path(args.target), args.scope_from)
