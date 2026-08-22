@@ -541,9 +541,42 @@ def launch_background(cmd: str, target: str, pointer_id: str):
         )
 
 
+def repeat_command_notice(cmd: str) -> str:
+    """Loop guard (harness observability): surface — never block — when this
+    exact command has already been executed in this workspace.
+
+    Re-running an identical command is the canonical agent-loop pathology ("calls
+    the same tool eleven times, confidently returning a result it never
+    re-validated"). A pentester may legitimately re-run, so this only warns and
+    points at the cached artifact so the operator can `inspect` it instead of
+    burning a turn. Returns a notice string, or "" if this is a first run.
+    """
+    board = load_json(BOARD_FILE)
+    if not board:
+        return ""
+    prior = [
+        p for p in board.get("execution_log_pointers", [])
+        if p.get("command") == cmd and p.get("pointer_id")
+    ]
+    if not prior:
+        return ""
+    last = prior[-1]
+    return (
+        f"[~] LOOP NOTICE: this exact command has already run {len(prior)} time(s). "
+        f"Last was {last.get('pointer_id')} (rc={last.get('return_code')}, "
+        f"\"{(last.get('summary') or '').strip()}\"). If nothing changed, reuse it: "
+        f"sec_flow.py inspect --id {last.get('pointer_id')} — don't re-run in a loop."
+    )
+
+
 def run_command(cmd: str, target: str = None, background: bool = False):
     ensure_blackboard_dirs()
     canary = preflight_checks(cmd, target)
+
+    notice = repeat_command_notice(cmd)
+    if notice:
+        print(notice, file=sys.stderr)
+
     pointer_id = f"MSG_{uuid.uuid4().hex[:8].upper()}"
 
     if background:
