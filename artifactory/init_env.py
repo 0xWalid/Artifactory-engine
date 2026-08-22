@@ -31,7 +31,7 @@ def init_target_workspace(target_dir: Path, scope_from: Path = None):
 
     if not board_file.exists():
         initial_board = {
-            "version": "1.2.0",
+            "version": "2.0.0",
             "target_path": str(target_dir),
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "discovered_assets": {
