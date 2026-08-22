@@ -388,10 +388,13 @@ def is_destructive_command(cmd: str) -> tuple[bool, str]:
 
     basenames = [tok.split("/")[-1] for tok in tokens]
 
-    # rm with a recursive or force flag (e.g. rm -rf, rm -r, rm -f)
+    # rm with a recursive or force flag (e.g. rm -rf, rm -r, rm -f). Only inspect
+    # actual flag tokens (those starting with '-') so a filename that merely
+    # contains 'r'/'f' after a hyphen (e.g. 'rm file-report.txt') is not blocked.
     for i, base in enumerate(basenames):
         if base == "rm":
-            flags = " ".join(tokens[i + 1:])
+            flag_tokens = [t for t in tokens[i + 1:] if t.startswith("-")]
+            flags = " ".join(flag_tokens)
             if re.search(r'-\w*[rf]', flags):
                 return True, "recursive/forced file deletion (rm -r/-f)"
 
@@ -541,9 +544,64 @@ def launch_background(cmd: str, target: str, pointer_id: str):
         )
 
 
+def repeat_command_notice(cmd: str) -> str:
+    """Loop guard (harness observability): surface — never block — when this
+    exact command has already been executed in this workspace.
+
+    Re-running an identical command is the canonical agent-loop pathology ("calls
+    the same tool eleven times, confidently returning a result it never
+    re-validated"). A pentester may legitimately re-run, so this only warns and
+    points at the cached artifact so the operator can `inspect` it instead of
+    burning a turn. Returns a notice string, or "" if this is a first run.
+    """
+    board = load_json(BOARD_FILE)
+    if not board:
+        return ""
+    prior = [
+        p for p in board.get("execution_log_pointers", [])
+        if p.get("command") == cmd and p.get("pointer_id")
+    ]
+    if not prior:
+        return ""
+    last = prior[-1]
+    return (
+        f"[~] LOOP NOTICE: this exact command has already run {len(prior)} time(s). "
+        f"Last was {last.get('pointer_id')} (rc={last.get('return_code')}, "
+        f"\"{(last.get('summary') or '').strip()}\"). If nothing changed, reuse it: "
+        f"sec_flow.py inspect --id {last.get('pointer_id')} — don't re-run in a loop."
+    )
+
+
+def shell_feature_notice(cmd: str) -> str:
+    """Warn — never block — when a command contains shell metacharacters.
+
+    The runner executes via shlex.split + shell=False (injection-safe), so pipes,
+    redirects, chains and substitutions are passed as LITERAL arguments, not
+    interpreted. Without this notice the operator sees confusing output instead
+    of an error. Returns a notice string, or "" if the command is a plain argv.
+    """
+    if re.search(r'(?<!\\)(\||>|<|&&|;|\$\(|`)', cmd):
+        return (
+            "[~] SHELL NOTICE: this command contains shell metacharacters "
+            "(| > < && ; $() `). The runner has no shell, so they are passed as "
+            "literal arguments, NOT interpreted. Run the stages as separate "
+            "commands, or (if you truly need a pipeline) wrap it: "
+            "bash -c '<pipeline>' — it still passes the scope/destructive gates."
+        )
+    return ""
+
+
 def run_command(cmd: str, target: str = None, background: bool = False):
     ensure_blackboard_dirs()
     canary = preflight_checks(cmd, target)
+
+    notice = repeat_command_notice(cmd)
+    if notice:
+        print(notice, file=sys.stderr)
+    shell_notice = shell_feature_notice(cmd)
+    if shell_notice:
+        print(shell_notice, file=sys.stderr)
+
     pointer_id = f"MSG_{uuid.uuid4().hex[:8].upper()}"
 
     if background:

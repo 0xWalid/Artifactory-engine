@@ -47,9 +47,13 @@ def strip_and_parameterize(raw_text: str, custom_target: str = None) -> str:
     # Standalone IPv4 addresses (any that were not part of a URL above).
     text = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '{{TARGET_HOST}}', text)
 
-    # Standalone bare domains (incl. subdomains) ending in a known TLD.
+    # Standalone bare domains (incl. subdomains) ending in a known TLD. A curated
+    # list (rather than a generic \.[a-z]{2,} match) is deliberate so code tokens
+    # like app.js / config.json / response.body are NOT mangled into placeholders.
     text = re.sub(
-        r'\b(?:[a-zA-Z0-9-]+\.)+(?:com|org|net|io|dev|app|co|edu|gov|local|internal|xyz|me|info)\b',
+        r'\b(?:[a-zA-Z0-9-]+\.)+(?:com|org|net|io|dev|app|co|edu|gov|mil|local|'
+        r'internal|corp|lan|xyz|me|info|biz|cloud|tech|site|online|store|network|'
+        r'uk|de|fr|es|it|nl|ru|cn|jp|kr|in|br|au|ca|us|eu|sh|gg|ly|to|id|ai)\b',
         '{{TARGET_HOST}}',
         text,
     )
