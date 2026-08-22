@@ -23,6 +23,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Shared, lock-serialised blackboard writes (no interleaving with sec_flow).
+_engine_dir = str(Path(__file__).resolve().parent)
+if _engine_dir not in sys.path:
+    sys.path.insert(0, _engine_dir)
+from board_io import json_transaction  # noqa: E402
+
 BLACKBOARD_DIR = Path.cwd() / ".blackboard"
 ARTIFACTS_DIR = BLACKBOARD_DIR / "artifacts"
 BOARD_FILE = BLACKBOARD_DIR / "board.json"
@@ -104,7 +110,7 @@ def read_artifact(pointer_id: str):
     return cmd, stdout, stderr
 
 
-def _mklead(ltype, value, signal, pointer_id, confidence=0.4, suggested_next=""):
+def _mklead(ltype, value, signal, pointer_id, confidence=0.4, suggested_next="", must_verify=False):
     return {
         "id": f"LEAD_{uuid.uuid4().hex[:6].upper()}",
         "type": ltype,
@@ -112,6 +118,7 @@ def _mklead(ltype, value, signal, pointer_id, confidence=0.4, suggested_next="")
         "signal": signal,
         "confidence": confidence,
         "suggested_next": suggested_next,
+        "must_verify": must_verify,
         "source_pointer": pointer_id,
         "status": "new",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -170,11 +177,13 @@ def deterministic_extract(cmd: str, stdout: str, stderr: str, pointer_id: str) -
                 "resolve + probe this host for its own surface",
             ))
 
-    # --- tech / version banners ---
+    # --- tech / version banners --- (flagged must_verify: a version -> known-CVE
+    # claim must be actively proven before it can become a confirmed finding).
     for m in re.finditer(r"(?im)^(?:Server|X-Powered-By):\s*(.+)$", combined):
         leads.append(_mklead(
             "tech", m.group(1).strip(), "server/framework banner", pointer_id, 0.35,
-            "map known CVEs / default paths for this stack",
+            "map known CVEs / default paths, then VERIFY before reporting",
+            must_verify=True,
         ))
 
     # --- high-signal anomalies (case-insensitive substring hits) ---
@@ -184,6 +193,7 @@ def deterministic_extract(cmd: str, stdout: str, stderr: str, pointer_id: str) -
             leads.append(_mklead(
                 "anomaly", meaning, needle, pointer_id, 0.8,
                 "confirm + escalate this signal into a finding",
+                must_verify=True,
             ))
 
     return leads
@@ -334,22 +344,38 @@ def triage_pointer(pointer_id: str):
                 lead["suggested_next"] = hit["suggested_next"]
 
     board = load_json(BOARD_FILE)
-    existing = board.setdefault("leads", [])
-    seen = {(l.get("type"), l.get("value")) for l in existing}
-    added = 0
+    if not board:
+        print(f"[!] Triage: {BOARD_FILE} not found; run init_env.py first.", file=sys.stderr)
+        return
+    existing_snapshot = board.get("leads", [])
+    seen = {(l.get("type"), l.get("value")) for l in existing_snapshot}
+    new_leads = []
     for lead in candidates:
         key = (lead["type"], lead["value"])
         if key in seen:
             continue
         seen.add(key)
-        existing.append(lead)
-        added += 1
+        new_leads.append(lead)
 
-    if added:
+    if not new_leads:
+        return
+
+    # Serialised write so a parallel agent's board update is not clobbered.
+    with json_transaction("board.json") as board:
+        if board is None:
+            return
+        existing = board.setdefault("leads", [])
+        live_keys = {(l.get("type"), l.get("value")) for l in existing}
+        added = 0
+        for lead in new_leads:
+            if (lead["type"], lead["value"]) in live_keys:
+                continue
+            existing.append(lead)
+            added += 1
         existing.sort(key=lambda l: l.get("confidence", 0), reverse=True)
-        board["updated_at"] = datetime.now(timezone.utc).isoformat()
-        BOARD_FILE.write_text(json.dumps(board, indent=2))
-        top = existing[0]
+        top = existing[0] if existing else None
+
+    if added and top:
         print(f"[+] Triage [{pointer_id}]: +{added} lead(s). "
               f"Top: [{top['type']}] {top['value']} (conf {top.get('confidence')})")
 
