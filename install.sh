@@ -26,7 +26,7 @@ mkdir -p "$ARTIFACTORY_DIR/.blackboard/artifacts"
 mkdir -p "$OPENCODE_CMD_DIR"
 mkdir -p "$OPENCODE_AGENT_DIR"
 
-for cat in recon web auth infra logic chaining; do
+for cat in recon web auth infra logic chaining sast; do
     mkdir -p "$ARTIFACTORY_DIR/prompts/$cat"
 done
 
@@ -37,6 +37,7 @@ chmod +x "$ARTIFACTORY_DIR/playbook_engine.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/ingest.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/report_engine.py" 2>/dev/null || true
 chmod +x "$ARTIFACTORY_DIR/triage.py" 2>/dev/null || true
+chmod +x "$ARTIFACTORY_DIR/sast.py" 2>/dev/null || true
 
 # 4. Register OpenCode command (/artifactory) with auto-reporting on findings
 cat << 'CMD_EOF' > "$OPENCODE_CMD_DIR/artifactory.md"
@@ -180,6 +181,17 @@ When provided an external writeup link or local text file, route it through the 
     `python3 ~/artifactory/ingest.py --content "<the working technique/PoC, live values will be parameterized>" --category <cat> --name <playbook_name> --source "engagement:<target>"`
   - This is the self-improving loop: the engine gets better at techniques over time, but every learned playbook lands as an approved git diff you can read and revert.
 
+### 6. `/artifactory scan-code <path>` (white-box SAST — scanner finds, you disprove, runtime proves)
+White-box companion to the black-box flow, built on the same principle as CodeQL+LLM tools (Vulnhalla): **a deterministic scanner is consistent, an LLM is not — so semgrep FINDS candidates, and your only job is to DISPROVE the false positives, then PROVE the survivors at runtime.** Do NOT ask an LLM to "find bugs" in raw code — that produces slop.
+- **Code scope is a separate, fail-closed gate** from the host/CIDR gate. Source is only scanned under a directory listed in `scope.json` → `allowed_code_paths` (empty by default = nothing scanned). Authorize the engagement's code path first (confirm you're allowed to have that source), e.g. edit `scope.json` and add the absolute path.
+- **Run the scan** (semgrep → SARIF → ranked `sast` leads on the board; no `--config auto`, so target source is never uploaded):
+  `python3 ~/artifactory/sec_flow.py sast --path "<source_dir>"` (optional `--config <ruleset>`).
+- **Consume `sast` leads, don't read SARIF:** `python3 ~/artifactory/sec_flow.py leads --type sast`. Every `sast` lead is `must_verify` at low confidence — it is a *candidate*, never a finding.
+- **Disprove with guided questions (the key technique):** for each lead, load the matching guided-question set and answer it FIRST, at **low temperature**, before ruling — describe the data flow, do not jump to a verdict:
+  `python3 ~/artifactory/playbook_engine.py --category sast --name <sqli|command_injection|path_traversal|ssrf|xss>`
+  Pull the flagged function + its callees for context via `sec_flow.py inspect --id <POINTER_ID>`. If the flow proves it's safe → `sec_flow.py leads --id <LEAD_ID> --set-status dead` (killing a false positive is the goal).
+- **Prove survivors dynamically (static→dynamic chain):** a `sast` candidate can NEVER become `confirmed` from static reasoning alone. Build a minimal, non-destructive runtime PoC against the **in-scope live host**, then log it with evidence exactly like any other finding: `sec_flow.py add-asset --finding "<Title>" --severity <sev> --status confirmed --evidence-from <POINTER_ID> --poc "<request+response>"`. The advisory will mark it as a static candidate that was dynamically confirmed.
+
 ### Background Scout (optional, token-saving brain)
 - Deterministic triage (endpoints, ports, subdomains, tech, high-signal anomalies) runs automatically and for FREE on every command — no setup needed.
 - For smarter lead ranking, enable the optional Scout model in `.blackboard/scout.json` (`enabled: true`) and export the API key it names. It is OpenAI-compatible and provider-agnostic — point `base_url`/`model` at any free tier (e.g. Groq's high daily limit, or an OpenRouter `:free` model). If it's disabled or unreachable, deterministic leads still populate — the engine never blocks on it.
@@ -220,6 +232,7 @@ mode: subagent
 ---
 You are the Artifactory **Verifier/Reporter** agent. You are the gate against false positives.
 - Only accept a finding when the exploit agent's evidence actually proves impact. Re-read the artifact if needed: `python3 ~/artifactory/sec_flow.py inspect --id <POINTER_ID> --grep "<sig>"`.
+- **`sast` leads (white-box):** these are semgrep candidates flagged `must_verify` — your primary job is to DISPROVE them. For each, load the guided questions (`python3 ~/artifactory/playbook_engine.py --category sast --name <class>`) and answer the data-flow questions FIRST at low temperature, using the flagged function + callees, before ruling. If the flow shows it's safe, mark the lead `--set-status dead`. A survivor still needs a runtime PoC against the live in-scope host before it can be `confirmed` — static reasoning alone is never enough.
 - Record a confirmed vulnerability ONLY with evidence:
   `python3 ~/artifactory/sec_flow.py add-asset --finding "<Title>" --severity <info|low|medium|high|critical> --status confirmed --evidence-from <POINTER_ID> --poc "<proof>"`.
 - If the evidence is weak/absent, leave it `informational` (the default) — do NOT force `confirmed`. The engine downgrades unproven findings automatically.
