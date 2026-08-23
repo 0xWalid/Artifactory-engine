@@ -783,10 +783,18 @@ if __name__ == "__main__":
     # leads (operator-facing: consume ranked leads instead of raw logs)
     leads_parser = subparsers.add_parser("leads", help="Show/triage ranked leads on the board")
     leads_parser.add_argument("--status", help="Filter by status (new|testing|confirmed|dead)")
-    leads_parser.add_argument("--type", dest="ltype", help="Filter by type (endpoint|port|subdomain|tech|anomaly)")
+    leads_parser.add_argument("--type", dest="ltype", help="Filter by type (endpoint|port|subdomain|tech|anomaly|sast)")
     leads_parser.add_argument("--limit", type=int, default=20, help="Max leads to show (default: 20)")
     leads_parser.add_argument("--id", dest="lead_id", help="Lead ID to update")
     leads_parser.add_argument("--set-status", dest="set_status", help="New status for --id")
+
+    # sast (white-box: semgrep finds candidates -> sast leads for the verifier)
+    sast_parser = subparsers.add_parser("sast", help="Run semgrep over authorised source -> sast leads")
+    sast_parser.add_argument("--path", "-p", required=True, help="Source directory/file to scan")
+    sast_parser.add_argument("--config", "-c", default=None,
+                             help="semgrep ruleset (default: pinned pack; never 'auto')")
+    sast_parser.add_argument("--background", "--bg", action="store_true", dest="background",
+                             help="(reserved) run detached; currently synchronous")
 
     args = parser.parse_args()
 
@@ -806,3 +814,9 @@ if __name__ == "__main__":
                       args.pointer, args.outcome)
     elif args.subcommand == "leads":
         show_leads(args.status, args.ltype, args.limit, args.lead_id, args.set_status)
+    elif args.subcommand == "sast":
+        import sast
+        run_kwargs = {"background": args.background}
+        if args.config:
+            run_kwargs["config"] = args.config
+        sast.run_sast(args.path, **run_kwargs)

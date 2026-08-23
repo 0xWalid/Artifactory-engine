@@ -111,7 +111,7 @@ runs. Do not emit ad-hoc commands. Follow this protocol in order:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="On-Demand Playbook Engine")
-    parser.add_argument("--category", "-c", required=True, choices=["recon", "web", "auth", "infra", "logic", "chaining"])
+    parser.add_argument("--category", "-c", required=True, choices=["recon", "web", "auth", "infra", "logic", "chaining", "sast"])
     parser.add_argument("--name", "-n", required=True, help="Playbook name (e.g., graphql_idor, s3_bucket_leak)")
     parser.add_argument("--author", "-a", default="Industry Specialist", help="Author/Practitioner reference")
     parser.add_argument("--target", "-t", default="", help="Target URL/Host for dynamic parameter substitution")

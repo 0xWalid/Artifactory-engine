@@ -112,7 +112,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tradecraft Ingestion Engine")
     parser.add_argument("--file", "-f", help="Path to raw writeup text file")
     parser.add_argument("--content", help="Raw text content to ingest directly (can also be read from stdin)")
-    parser.add_argument("--category", "-c", required=True, choices=["recon", "web", "auth", "infra", "logic", "chaining"])
+    parser.add_argument("--category", "-c", required=True, choices=["recon", "web", "auth", "infra", "logic", "chaining", "sast"])
     parser.add_argument("--name", "-n", required=True, help="Playbook target name (e.g., graphql_idor)")
     parser.add_argument("--source", "-s", default="", help="Source reference URL or Article title")
     parser.add_argument("--target-domain", "-t", default="", help="Specific target domain to strip out if known")

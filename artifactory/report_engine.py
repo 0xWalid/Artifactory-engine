@@ -129,6 +129,17 @@ def generate_individual_reports():
         else:
             matching_logs = execution_logs[-5:]
 
+        # Flag static-origin findings: if a related command was a semgrep scan,
+        # this bug started as a SAST candidate and was then dynamically proven —
+        # make that provenance explicit in the advisory.
+        static_origin = any(
+            (log.get("command") or "").strip().startswith("semgrep")
+            for log in execution_logs
+            if log.get("pointer_id") in related_ids
+        )
+        if static_origin:
+            details = f"_(Static candidate found by SAST, dynamically confirmed.)_\n\n{details}"
+
         # Save dedicated evidence dump
         evidence_filename = f"evidence_{finding_id}_{slug_title}.txt"
         evidence_path = EVIDENCE_DIR / evidence_filename

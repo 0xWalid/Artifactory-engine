@@ -319,6 +319,108 @@ def scout_rank(candidates: list, scout_cfg: dict) -> dict:
     return {}
 
 
+def _merge_leads(candidates: list, pointer_id: str):
+    """Dedup `candidates` against board.json and append the new ones under a
+    single serialised transaction. Shared by network triage and SAST triage."""
+    board = load_json(BOARD_FILE)
+    if not board:
+        print(f"[!] Triage: {BOARD_FILE} not found; run init_env.py first.", file=sys.stderr)
+        return
+    existing_snapshot = board.get("leads", [])
+    seen = {(l.get("type"), l.get("value")) for l in existing_snapshot}
+    new_leads = []
+    for lead in candidates:
+        key = (lead["type"], lead["value"])
+        if key in seen:
+            continue
+        seen.add(key)
+        new_leads.append(lead)
+
+    if not new_leads:
+        return
+
+    # Serialised write so a parallel agent's board update is not clobbered.
+    added = 0
+    top = None
+    with json_transaction("board.json") as board:
+        if board is None:
+            return
+        existing = board.setdefault("leads", [])
+        live_keys = {(l.get("type"), l.get("value")) for l in existing}
+        for lead in new_leads:
+            if (lead["type"], lead["value"]) in live_keys:
+                continue
+            existing.append(lead)
+            added += 1
+        existing.sort(key=lambda l: l.get("confidence", 0), reverse=True)
+        top = existing[0] if existing else None
+
+    if added and top:
+        print(f"[+] Triage [{pointer_id}]: +{added} lead(s). "
+              f"Top: [{top['type']}] {top['value']} (conf {top.get('confidence')})")
+
+
+def sast_extract(sarif_obj: dict, pointer_id: str) -> list:
+    """Convert a semgrep SARIF document into `sast` leads.
+
+    Each result is a *candidate* the deterministic scanner is confident about;
+    it is flagged must_verify at low confidence because the AI still has to
+    disprove false positives (guided questions) and prove survivors at runtime
+    before the verification gate will ever mark it confirmed.
+    """
+    leads = []
+    for run in sarif_obj.get("runs", []) or []:
+        for res in run.get("results", []) or []:
+            rule_id = res.get("ruleId") or "unknown-rule"
+            message = ((res.get("message") or {}).get("text") or "").strip()
+
+            file_uri, start_line, snippet = "", None, ""
+            locs = res.get("locations") or []
+            if locs:
+                phys = (locs[0] or {}).get("physicalLocation") or {}
+                file_uri = ((phys.get("artifactLocation") or {}).get("uri") or "")
+                region = phys.get("region") or {}
+                start_line = region.get("startLine")
+                snippet = ((region.get("snippet") or {}).get("text") or "").strip()
+
+            loc = f"{file_uri}:{start_line}" if start_line else (file_uri or "?")
+            value = f"{loc} {rule_id}".strip()
+            signal = message or rule_id
+            if snippet:
+                signal = f"{signal} — `{snippet[:160]}`"
+
+            leads.append(_mklead(
+                "sast", value, signal, pointer_id,
+                confidence=0.3,
+                suggested_next=(
+                    "load prompts/sast/<class> guided questions, answer the data-flow "
+                    "questions (low temp) to disprove or keep, then PROVE with a runtime PoC"
+                ),
+                must_verify=True,
+            ))
+    return leads
+
+
+def triage_sast(pointer_id: str):
+    """Parse a stored semgrep-SARIF artifact into sast leads on the board."""
+    if not BOARD_FILE.exists():
+        print(f"[!] Triage: {BOARD_FILE} not found; run init_env.py first.", file=sys.stderr)
+        return
+    _, stdout, _ = read_artifact(pointer_id)
+    if not stdout:
+        print(f"[!] Triage: SARIF artifact {pointer_id} empty or not found.", file=sys.stderr)
+        return
+    try:
+        sarif_obj = json.loads(stdout)
+    except Exception as e:
+        print(f"[!] Triage: {pointer_id} stdout is not valid SARIF JSON ({e}).", file=sys.stderr)
+        return
+    candidates = sast_extract(sarif_obj, pointer_id)
+    if not candidates:
+        return
+    _merge_leads(candidates, pointer_id)
+
+
 def triage_pointer(pointer_id: str):
     if not BOARD_FILE.exists():
         print(f"[!] Triage: {BOARD_FILE} not found; run init_env.py first.", file=sys.stderr)
@@ -343,41 +445,7 @@ def triage_pointer(pointer_id: str):
             if hit.get("suggested_next"):
                 lead["suggested_next"] = hit["suggested_next"]
 
-    board = load_json(BOARD_FILE)
-    if not board:
-        print(f"[!] Triage: {BOARD_FILE} not found; run init_env.py first.", file=sys.stderr)
-        return
-    existing_snapshot = board.get("leads", [])
-    seen = {(l.get("type"), l.get("value")) for l in existing_snapshot}
-    new_leads = []
-    for lead in candidates:
-        key = (lead["type"], lead["value"])
-        if key in seen:
-            continue
-        seen.add(key)
-        new_leads.append(lead)
-
-    if not new_leads:
-        return
-
-    # Serialised write so a parallel agent's board update is not clobbered.
-    with json_transaction("board.json") as board:
-        if board is None:
-            return
-        existing = board.setdefault("leads", [])
-        live_keys = {(l.get("type"), l.get("value")) for l in existing}
-        added = 0
-        for lead in new_leads:
-            if (lead["type"], lead["value"]) in live_keys:
-                continue
-            existing.append(lead)
-            added += 1
-        existing.sort(key=lambda l: l.get("confidence", 0), reverse=True)
-        top = existing[0] if existing else None
-
-    if added and top:
-        print(f"[+] Triage [{pointer_id}]: +{added} lead(s). "
-              f"Top: [{top['type']}] {top['value']} (conf {top.get('confidence')})")
+    _merge_leads(candidates, pointer_id)
 
 
 if __name__ == "__main__":

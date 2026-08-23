@@ -68,6 +68,11 @@ def init_target_workspace(target_dir: Path, scope_from: Path = None):
                 "allowed_domains": ["*.local.target"],
                 "allowed_cidrs": ["127.0.0.0/8"],
                 "pending_scope": [],
+                # White-box SAST gate (separate from the network host/CIDR gate):
+                # semgrep may only scan code under a directory listed here. Empty
+                # by default => fail-closed, no local source is scanned until the
+                # operator authorises an engagement code path.
+                "allowed_code_paths": [],
                 "disallowed_actions": ["DESTRUCTIVE_WRITE", "DOS"]
             }
         scope_file.write_text(json.dumps(initial_scope, indent=2))
