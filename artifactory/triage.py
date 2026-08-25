@@ -110,7 +110,8 @@ def read_artifact(pointer_id: str):
     return cmd, stdout, stderr
 
 
-def _mklead(ltype, value, signal, pointer_id, confidence=0.4, suggested_next="", must_verify=False):
+def _mklead(ltype, value, signal, pointer_id, confidence=0.4, suggested_next="",
+            must_verify=False, preconditions=None):
     return {
         "id": f"LEAD_{uuid.uuid4().hex[:6].upper()}",
         "type": ltype,
@@ -119,6 +120,10 @@ def _mklead(ltype, value, signal, pointer_id, confidence=0.4, suggested_next="",
         "confidence": confidence,
         "suggested_next": suggested_next,
         "must_verify": must_verify,
+        # Precondition matrix: feature-gated bugs list what must be enabled in a
+        # lab before they are testable ("FGAPv2 enabled", ...). Set status to
+        # 'blocked_precondition' to schedule them instead of skipping.
+        "preconditions": [p for p in (preconditions or []) if p],
         "source_pointer": pointer_id,
         "status": "new",
         "created_at": datetime.now(timezone.utc).isoformat(),

@@ -32,18 +32,21 @@ artifactory-engine/
 └── artifactory/                <-- Core Engine Pipeline
     ├── init_env.py             <-- Workspace initializer (creates .blackboard/, schemas, scope, canary)
     ├── sec_flow.py             <-- Safe runner, fail-closed scope gate, canary + destructive guards, log inspection & asset tracker
-    ├── playbook_engine.py      <-- Parameterized playbook renderer & methodology-synthesis trigger
+    ├── playbook_engine.py      <-- Parameterized playbook renderer, research-library suggestions & methodology-synthesis trigger
     ├── ingest.py               <-- Tradecraft parameterizer, quality-checker & writer
-    ├── report_engine.py        <-- Per-finding advisory & evidence-log generator (auto-run on new findings)
+    ├── report_engine.py        <-- Per-finding advisory, evidence-log & coverage-gap generator (auto-run on new findings)
     ├── triage.py               <-- Background triage + Scout brain: raw output -> ranked leads
+    ├── sast.py                 <-- White-box SAST bridge (semgrep -> candidates -> guided disproof -> runtime PoC)
+    ├── intel.py                <-- Changelog-first CVE intel (OSV/NVD full-index), distro SCA inventory, source detection
+    ├── knowledge/sources.json  <-- Curated research library (60 authoritative URLs) feeding playbook synthesis
     └── prompts/                <-- Reusable Tradecraft Playbook Library
         ├── recon/              <-- Discovery & mapping tradecraft
         ├── web/                <-- Web app testing procedures
         ├── auth/               <-- Authentication & session checks
         ├── infra/              <-- Cloud & infrastructure playbooks
         ├── logic/              <-- Business logic & access control flaws
-        └── chaining/           <-- Multi-vector chaining strategies
-
+        ├── chaining/           <-- Multi-vector chaining strategies
+        └── sast/               <-- Guided disproof questions per bug class
 ```
 
 ---
@@ -60,13 +63,16 @@ chmod +x install.sh
 
 ### What `install.sh` Does:
 
-1. Creates a path symlink: `~/artifactory` -> `Artifactory-engine/artifactory` (so the engine code runs live from the repo).
+`install.sh` treats the checkout you run it from as the **source** and promotes it into a **stable release directory** you use day to day:
+
+1. **Promotes source → stable:** copies the engine into `~/artifactory-engine/` — created if missing, refreshed if it already exists — and drops the release's own `install.sh` + `README.md` alongside it. (Run it again after editing the source to push updates through.)
 2. Creates the prompt category directories and local storage paths.
-3. Sets execution permissions across all core Python scripts (`init_env.py`, `sec_flow.py`, `playbook_engine.py`, `ingest.py`, `report_engine.py`).
-4. Registers the `/artifactory` custom command under `~/.config/opencode/commands/artifactory.md`.
+3. Sets execution permissions across all core Python scripts (`init_env.py`, `sec_flow.py`, `playbook_engine.py`, `ingest.py`, `report_engine.py`, `triage.py`, `sast.py`, `intel.py`).
+4. Registers the `/artifactory` command and the `recon`/`exploit`/`verifier` subagents under `~/.config/opencode/`, **rewriting every engine path to the absolute stable location** (`~/artifactory-engine/artifactory/...`) — no `~/artifactory` symlink is created.
 5. Checks for optional external tools (`python3`, `git`, `semgrep`, `nmap`, `httpx`, `ffuf`) — it reports which are missing but does **not** install them.
 
-> **Note:** The Python engine runs live through the symlink, so editing a `.py` file takes effect immediately. The `/artifactory` command doc is a **copy**, so after changing it (or `install.sh`) you must re-run `./install.sh` to refresh it.
+> **Note:** The stable copy is independent of the source checkout (no symlink), so after editing a source `.py` file or the `/artifactory` command you must re-run `./install.sh` to push the change into `~/artifactory-engine/`.
+
 
 ---
 
@@ -110,6 +116,56 @@ Run `opencode` inside any target workspace directory and invoke the engine on de
 * **Quality Gate:** Checks that input contains actionable technical details (HTTP methods, parameters, CLI tools).
 * **Sanitization:** Replaces hardcoded domains, IPs, and bearer tokens with generic template variables (`{{TARGET_HOST}}`, `{{TARGET_URL}}`, `{{AUTH_TOKEN}}`).
 * **Human-in-the-Loop Review:** Summarizes extracted mechanics and category before writing to `prompts/<category>/<name>.md`.
+* **One source at a time.** `ingest` handles a single URL or a single writeup file. For a **file listing many URLs**, use `/artifactory research` (below) — it loops each URL through this same pipeline.
+
+### 3b. Batch Playbook Synthesis & Source Discovery
+
+Turn the curated research library (`knowledge/sources.json`, ~60 authoritative URLs) into playbooks in bulk, and grow that library — all human-approved, driven from OpenCode. The engine has **no crawler**: the agent fetches + synthesizes, deterministic engine subcommands list/dedup/save, and you approve.
+
+#### In plain terms
+
+Think of it as three parts working together:
+
+1. **A list of good sources** — a text catalog of quality security write-ups (`knowledge/sources.json`, mirrored to `knowledge/methodology_urls.txt`). This is just a bookmark list.
+2. **`research` — turn the list into playbooks.** It reads the list, and for every source that doesn't have a playbook yet, it reads the write-up and writes a reusable, step-by-step testing methodology. It shows you all of them in **one table** to approve, then saves them.
+3. **`discover` — grow the list.** It searches trusted security sites for new write-ups on a topic you name, you approve the good ones, and they're added to the list automatically.
+
+**The list never empties.** `research` doesn't cross URLs off — it checks which playbooks already exist on disk and skips those. So running `research` again just skips everything you've already built (`0 new`), which is why it's safe to stop and re-run anytime.
+
+**It never re-spends tokens on a playbook you already built.** Before fetching anything, the engine filters the worklist to *pending only* (`--sources-json --pending`) — sources with no playbook on disk yet. Built ones are removed by the engine, so the agent can't re-download or re-synthesize them. You pay the fetch/synthesis token cost **once per source, ever**; re-runs only touch genuinely new sources.
+
+**To keep improving, the loop is:** `discover <topic>` (add new sources) → `research` (build playbooks from them) → repeat. Each round your library gets bigger and your playbooks more complete. You can also add a single URL by hand with `--add-source`, or build one playbook immediately with `/artifactory ingest <url>`.
+
+```text
+/artifactory research [category]     # build playbooks from the source library (batched approval)
+/artifactory discover <bug-class>    # find NEW authoritative sources, then persist them
+```
+
+* **`research`:** pulls the **pending-only** worklist (`playbook_engine.py --sources-json --pending [--category <cat>]`) — the engine drops every source whose playbook already exists on disk, so already-built sources are **never re-fetched or re-synthesized** (token cost paid once per source, ever). It fetches + synthesizes the rest into parameterized methodologies, presents **one summary table** (`<pending> pending / <total> total`) for approve-all / select / adjust, then saves each under the engine-supplied `save_category`/`save_name` (so the skip stays deterministic next run) and reports saved / skipped / failed (no silent drops).
+* **`discover`:** web-searches a **trusted-domain allowlist only** (PortSwigger, James Kettle, Orange Tsai, OWASP, GitHub advisories, Project Zero, Assetnote, …), proposes candidates for approval, then persists them via `playbook_engine.py --add-source` (URL-deduped) — which auto-reflows `knowledge/methodology_urls.txt`. Chains straight into `research`.
+* **Registry CLI (deterministic, no network):** `playbook_engine.py --list-sources` / `--sources-json` (browse; add `--pending` for only-not-yet-built), `--add-source --url … --title … --category …` (add), `--export-urls [--category <cat>] [--pending]` (regenerate the flat URL feed; `--pending` writes a shrinking to-do feed).
+* **Safety:** fetched pages are treated as untrusted data (never as instructions); every new source and playbook is human-approved and lands as a reviewable git diff.
+
+### 4. Vulnerability Intelligence & Distro SCA (`intel.py`)
+
+Changelog-first intel for product engagements — enumerate from authoritative indexes instead of keyword luck:
+
+```bash
+# Full-index CVE enumeration (OSV.dev + NVD; every candidate becomes a visible `cve` lead)
+python3 ~/artifactory-engine/artifactory/sec_flow.py intel --product "keycloak" --version 26.0.0 \
+  --preconditions "FGAPv2 enabled"        # feature-gated bugs get the precondition matrix
+
+# Distro SCA: inventory jars / package-lock.json / requirements.txt / go.sum -> OSV batch check
+python3 ~/artifactory-engine/artifactory/sec_flow.py sca --path ./lib
+
+# Detect source trees in a workspace (analyze auto-wires SAST+SCA from this)
+python3 ~/artifactory-engine/artifactory/sec_flow.py detect --path .
+```
+
+* **Passive-intel allowlist:** these lookups are read-only queries against hardcoded public services (`api.osv.dev`, `services.nvd.nist.gov`) about public data — governed separately from the fail-closed target scope gate, which is untouched.
+* **No silent drops:** every candidate CVE becomes a lead flagged `must_verify`; network/index failures file explicit coverage-gap leads instead of quietly returning zero.
+* **Precondition matrix:** feature-gated leads get parked with `leads --id <ID> --set-status blocked_precondition` ("lab-enable then test") instead of being skipped.
+* **Research library:** `artifactory/knowledge/sources.json` indexes ~60 authoritative sources (PortSwigger Research, Orange Tsai, TBHM, OWASP, cloud/SAST/intel references). Missing playbooks auto-suggest matching entries; browse with `playbook_engine.py --list-sources [--category <cat>]`.
 
 ---
 
@@ -120,7 +176,7 @@ Run `opencode` inside any target workspace directory and invoke the engine on de
 Fail-closed: a missing/empty `scope.json` permits nothing, and every command must declare an in-scope `--target`. Validates domains, hosts, and IP subnets (with DNS resolution) before executing:
 
 ```bash
-python3 ~/artifactory/sec_flow.py run --cmd "curl -s http://127.0.0.1:8080" --target "127.0.0.1"
+python3 ~/artifactory-engine/artifactory/sec_flow.py run --cmd "curl -s http://127.0.0.1:8080" --target "127.0.0.1"
 
 ```
 
@@ -141,7 +197,7 @@ Artifactory is for testing **targets you are authorized to assess**. Within an i
 Recording a finding auto-compiles a markdown advisory plus an evidence log under `./reports/`, correlated to the exact pointer IDs that proved it. Regenerate manually with:
 
 ```bash
-python3 ~/artifactory/report_engine.py
+python3 ~/artifactory-engine/artifactory/report_engine.py
 
 ```
 
@@ -151,7 +207,7 @@ A finding is **`informational` by default** and only becomes a **`confirmed` vul
 
 ```bash
 # Prove it first, then log the confirmed finding WITH its evidence:
-python3 ~/artifactory/sec_flow.py add-asset --finding "Auth bypass on /admin" \
+python3 ~/artifactory-engine/artifactory/sec_flow.py add-asset --finding "Auth bypass on /admin" \
   --severity high --status confirmed --evidence-from MSG_ABCD1234 \
   --poc "GET /admin with X-Forwarded-For: 127.0.0.1 -> 200 + admin panel"
 ```
@@ -163,9 +219,9 @@ Leads flagged `must_verify` by the Scout (tech/version banners → potential CVE
 Scope is per workspace. Reuse an approved scope across engagements with `init_env.py --target . --scope-from <saved-scope.json>`. Discovered subdomains are **not auto-trusted**: a host under an already-authorized apex/wildcard is auto-added to `allowed_hosts`; anything else is queued in `pending_scope` until you approve it.
 
 ```bash
-python3 ~/artifactory/sec_flow.py scope --add-domain "*.example.com"   # authorize a wildcard
-python3 ~/artifactory/sec_flow.py scope --list                        # view scope + pending
-python3 ~/artifactory/sec_flow.py scope --approve staging.acme.com     # promote a pending host
+python3 ~/artifactory-engine/artifactory/sec_flow.py scope --add-domain "*.example.com"   # authorize a wildcard
+python3 ~/artifactory-engine/artifactory/sec_flow.py scope --list                        # view scope + pending
+python3 ~/artifactory-engine/artifactory/sec_flow.py scope --approve staging.acme.com     # promote a pending host
 ```
 
 ### Multi-Agent Roles & the Decision Journal
@@ -180,7 +236,7 @@ The engine runs as a team over the shared blackboard (writes are OS-lock-seriali
 Every action can be journaled so the report explains *why it did what and how each result was reached*:
 
 ```bash
-python3 ~/artifactory/sec_flow.py add-rationale --lead LEAD_AB12CD \
+python3 ~/artifactory-engine/artifactory/sec_flow.py add-rationale --lead LEAD_AB12CD \
   --hypothesis "old Apache -> CVE-2021-41773" --why "Server banner matched" \
   --action "path-traversal probe" --pointer MSG_ABCD1234 --outcome confirmed
 ```
@@ -200,13 +256,13 @@ Run heavy enumeration detached so nothing blocks, then pull the digest:
 
 ```bash
 # Launch a scan in the background (returns immediately; results + leads land on the board when done)
-python3 ~/artifactory/sec_flow.py run --bg --cmd "ffuf -u http://127.0.0.1:8080/FUZZ -w list.txt" --target "127.0.0.1"
+python3 ~/artifactory-engine/artifactory/sec_flow.py run --bg --cmd "ffuf -u http://127.0.0.1:8080/FUZZ -w list.txt" --target "127.0.0.1"
 
 # Consume the ranked leads instead of raw logs (anomaly > port/endpoint > tech)
-python3 ~/artifactory/sec_flow.py leads --status new
+python3 ~/artifactory-engine/artifactory/sec_flow.py leads --status new
 
 # Mark a lead as you work it
-python3 ~/artifactory/sec_flow.py leads --id LEAD_ABC123 --set-status testing
+python3 ~/artifactory-engine/artifactory/sec_flow.py leads --id LEAD_ABC123 --set-status testing
 
 ```
 
@@ -218,10 +274,10 @@ Inspects large artifact logs (`>100 lines`) on demand using targeted regex or st
 
 ```bash
 # Query lines matching a specific pattern
-python3 ~/artifactory/sec_flow.py inspect --id MSG_A1B2C3D4 --grep "HTTP/1.1 200" --lines 20
+python3 ~/artifactory-engine/artifactory/sec_flow.py inspect --id MSG_A1B2C3D4 --grep "HTTP/1.1 200" --lines 20
 
 # Extract a specific field from structured JSON tool outputs
-python3 ~/artifactory/sec_flow.py inspect --id MSG_A1B2C3D4 --json-key "host"
+python3 ~/artifactory-engine/artifactory/sec_flow.py inspect --id MSG_A1B2C3D4 --json-key "host"
 
 ```
 
@@ -230,7 +286,7 @@ python3 ~/artifactory/sec_flow.py inspect --id MSG_A1B2C3D4 --json-key "host"
 Updates local workspace state without loading or rewriting full JSON files in memory:
 
 ```bash
-python3 ~/artifactory/sec_flow.py add-asset --endpoint "/api/v1/auth" --port "8080/tcp"
-python3 ~/artifactory/sec_flow.py add-asset --finding "Exposed Metrics Endpoint" --details "Found unprotected /metrics route"
+python3 ~/artifactory-engine/artifactory/sec_flow.py add-asset --endpoint "/api/v1/auth" --port "8080/tcp"
+python3 ~/artifactory-engine/artifactory/sec_flow.py add-asset --finding "Exposed Metrics Endpoint" --details "Found unprotected /metrics route"
 
 ```

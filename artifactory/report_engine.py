@@ -229,6 +229,33 @@ def generate_individual_reports():
                 f"_(no PoC/evidence; verify before reporting)_"
             )
 
+    # Coverage gaps (no-silent-drops): every lead that never reached a terminal
+    # state is an explicit blind spot in this engagement — surface them so
+    # 'we didn't test X' is visible instead of silently dropped.
+    leads = board_data.get("leads", [])
+    open_leads = [l for l in leads if l.get("status") not in ("confirmed", "dead")]
+    summary_lines.append("\n## Coverage Gaps (unworked/unresolved leads — potential blind spots)")
+    if not open_leads:
+        summary_lines.append("_All leads were worked to a terminal state (confirmed/dead)._")
+    else:
+        by_status = {}
+        for l in open_leads:
+            by_status.setdefault(l.get("status", "?"), []).append(l)
+        stat_bits = [f"{len(v)} `{k}`" for k, v in sorted(by_status.items())]
+        summary_lines.append(
+            f"**{len(open_leads)} lead(s) never resolved** ({', '.join(stat_bits)} of "
+            f"{len(leads)} total). Highest-confidence unworked items:"
+        )
+        open_sorted = sorted(open_leads, key=lambda l: l.get("confidence", 0), reverse=True)
+        for l in open_sorted[:10]:
+            pre = f" — preconditions: {'; '.join(l['preconditions'])}" if l.get("preconditions") else ""
+            summary_lines.append(
+                f"- **[{l.get('confidence')}]** ({l.get('type')}/{l.get('status')}) "
+                f"{l.get('value')}{pre}"
+            )
+        if len(open_sorted) > 10:
+            summary_lines.append(f"- _...and {len(open_sorted) - 10} more (see board.json `leads`)._")
+
     # WS7: 'How we got here' — the decision journal, so a reader can see WHY the
     # engine did what it did and HOW each result was reached.
     rationale = load_rationale()

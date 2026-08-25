@@ -1,0 +1,144 @@
+# Artifactory methodology source URLs
+# ------------------------------------
+# One authoritative source per line. Feed this list to the framework
+# from OpenCode with `/artifactory research` to turn each into a
+# parameterized .md playbook (fetch -> quality-gate -> approval -> save).
+# Lines starting with # are comments and are skipped on ingest.
+# Regenerate with: playbook_engine.py --export-urls [--category <cat>]
+# Generated from knowledge/sources.json (60 sources).
+
+# --- web ---
+# James Kettle — full research portfolio
+https://jameskettle.com/
+# HTTP Desync Attacks: Request Smuggling Reborn
+https://portswigger.net/research/http-desync-attacks-request-smuggling-reborn
+# Browser-Powered Desync Attacks
+https://portswigger.net/research/browser-powered-desync-attacks
+# HTTP/2: The Sequel Is Always Worse
+https://portswigger.net/research/http2-the-sequel-is-always-worse
+# HTTP/1 Must Die (0.CL / desync latest)
+https://portswigger.net/research/http1-must-die
+# Web Cache Entanglement: Novel Pathways to Poisoning
+https://portswigger.net/research/web-cache-entanglement
+# Practical Web Cache Poisoning
+https://portswigger.net/research/practical-web-cache-poisoning
+# Smashing the State Machine (race conditions)
+https://portswigger.net/research/smashing-the-state-machine
+# Server-Side Template Injection
+https://portswigger.net/research/server-side-template-injection
+# PDF exploration: SSRF in PDF generators
+https://portswigger.net/research/ssrf-attacks-via-pdf-generation
+# PortSwigger Web Security Academy
+https://portswigger.net/web-security
+# Orange Tsai blog (DEVCORE)
+https://blog.orange.tw/
+# A New Era of SSRF (Black Hat USA 2017)
+https://www.blackhat.com/docs/us-17/thursday/us-17-Tsai-A-New-Era-Of-SSRF-Exploiting-URL-Parser-In-Trending-Programming-Languages.pdf
+# Breaking Parser Logic: path normalization 0days (BH USA 2018)
+https://i.blackhat.com/us-18/Wed-August-8/us-18-Orange-Tsai-Breaking-Parser-Logic-Take-Your-Path-Normalization-Off-And-Pop-0days-Out-2.pdf
+# Confusion Attacks: Exploiting Hidden Parameter Ambiguity (Apache HTTPd)
+https://blog.orange.tw/posts/2024-08-confusion-attacks-en/
+# PayloadsAllTheThings
+https://github.com/swisskyrepo/PayloadsAllTheThings
+# OWASP Web Security Testing Guide (WSTG)
+https://owasp.org/www-project-web-security-testing-guide/latest/
+# Server-Side Prototype Pollution
+https://portswigger.net/research/server-side-prototype-pollution
+# ysoserial (Java deserialization payloads)
+https://github.com/frohoff/ysoserial
+# GoSecure XXE research hub
+https://www.gosecure.net/blog/2019/07/16/abusing-xxe-in-office-files-to-exfiltrate-data-and-attack-internal-servers/
+# Detectify Labs research
+https://labs.detectify.com/
+# PortSwigger Research index (all papers)
+https://portswigger.net/research
+
+# --- recon ---
+# The Bug Hunter's Methodology (TBHM) repo
+https://github.com/jhaddix/tbhm
+# Jason Haddix — content discovery / recon gists
+https://gist.github.com/jhaddix/86a06c5dc309d08580a018c66354a056
+# HackTricks Book
+https://book.hacktricks.xyz/
+# Assetnote research blog
+https://www.assetnote.io/resources
+# SecLists
+https://github.com/danielmiessler/SecLists
+# Nuclei templates
+https://github.com/projectdiscovery/nuclei-templates
+
+# --- auth ---
+# OWASP Cheat Sheet Series
+https://cheatsheetseries.owasp.org/
+# Critical Vulnerabilities in JSON Web Token libraries
+https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/
+# JWT Attack Playbook / Handbook references
+https://portswigger.net/web-security/jwt
+# OAuth 2.0 vulnerabilities (Academy section)
+https://portswigger.net/web-security/oauth
+# Session hijacking / fixation / weakness tests
+https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/06-Session_Management_Testing/
+# Password Reset Poisoning (host header)
+https://portswigger.net/web-security/host-header/exploiting/password-reset-poisoning
+
+# --- logic ---
+# OWASP API Security Top 10
+https://owasp.org/www-project-api-security/
+# API Security Checklist
+https://github.com/API-Security/API-Security-Checklist
+# IDOR playbook (TBHM IDOR chapter pattern)
+https://github.com/JHaddix/HUNT
+# ZSeano's bug bounty methodology (hack-to-learn)
+https://www.bugbountyhunter.com/methodology/zseanos-methodology.pdf
+# GraphQL Threat Matrix
+https://github.com/dolevf/graphql-threat-matrix
+
+# --- infra ---
+# Google Project Zero blog
+https://googleprojectzero.blogspot.com/
+# MITRE ATT&CK
+https://attack.mitre.org/
+# Hacking The Cloud
+https://hackingthe.cloud/
+# AWS IAM Privilege Escalation — methods & mitigation
+https://rhinosecuritylabs.com/aws/aws-privilege-escalation-methods-mitigation/
+# GTFOBins
+https://gtfobins.github.io/
+# LOLBAS
+https://lolbas-project.github.io/
+# OWASP MASTG (mobile)
+https://mas.owasp.org/
+# Top 10 CI/CD Security Risks
+https://github.com/cider-security-research/top-10-cicd-security-risks
+
+# --- intel ---
+# Trickest CVE repository (POCs by CVE)
+https://github.com/trickest/cve
+# CISA Known Exploited Vulnerabilities
+https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+# OSV.dev API (keyless vulnerability index)
+https://google.github.io/osv.dev/api/
+# NVD CVE API 2.0
+https://nvd.nist.gov/developers/vulnerabilities
+# Red Hat Security Data API
+https://access.redhat.com/documentation/en-us/red_hat_security_data_api/1.0/html/red_hat_security_data_api/index
+# GitHub Advisory Database
+https://github.com/advisories
+
+# --- sast ---
+# Semgrep rules registry
+https://semgrep.dev/explore
+# OWASP Code Review Guide
+https://owasp.org/www-project-code-review-guide/
+# CodeQL query library
+https://github.com/github/codeql
+
+# --- learning ---
+# Hacker101
+https://www.hacker101.com/
+# Bugcrowd University
+https://github.com/bugcrowd/bugcrowd_university
+# CTF Field Guide
+https://trailofbits.github.io/ctf/
+# pwn.college
+https://pwn.college/

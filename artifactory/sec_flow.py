@@ -140,25 +140,28 @@ def classify_and_expand_scope(host: str) -> str:
     return outcome
 
 
-def manage_scope(add_host=None, add_domain=None, add_cidr=None, approve=None, do_list=False):
+def manage_scope(add_host=None, add_domain=None, add_cidr=None, add_code_path=None,
+                 approve=None, do_list=False):
     """WS2: operator-facing scope editing + per-project visibility."""
     if not SCOPE_FILE.exists():
         print(f"[!] Error: {SCOPE_FILE} not found. Run init_env.py first.", file=sys.stderr)
         sys.exit(1)
 
-    if do_list and not any([add_host, add_domain, add_cidr, approve]):
+    if do_list and not any([add_host, add_domain, add_cidr, add_code_path, approve]):
         scope = load_json(SCOPE_FILE)
         print("[*] Current scope:")
-        print(f"    allowed_hosts:   {scope.get('allowed_hosts', [])}")
-        print(f"    allowed_domains: {scope.get('allowed_domains', [])}")
-        print(f"    allowed_cidrs:   {scope.get('allowed_cidrs', [])}")
-        print(f"    pending_scope:   {scope.get('pending_scope', [])}  (awaiting --approve)")
+        print(f"    allowed_hosts:      {scope.get('allowed_hosts', [])}")
+        print(f"    allowed_domains:    {scope.get('allowed_domains', [])}")
+        print(f"    allowed_cidrs:      {scope.get('allowed_cidrs', [])}")
+        print(f"    allowed_code_paths: {scope.get('allowed_code_paths', [])}")
+        print(f"    pending_scope:      {scope.get('pending_scope', [])}  (awaiting --approve)")
         return
 
     with json_transaction("scope.json", create=True) as scope:
         allowed_hosts = scope.setdefault("allowed_hosts", [])
         allowed_domains = scope.setdefault("allowed_domains", [])
         allowed_cidrs = scope.setdefault("allowed_cidrs", [])
+        allowed_code_paths = scope.setdefault("allowed_code_paths", [])
         pending = scope.setdefault("pending_scope", [])
 
         if add_host and add_host not in allowed_hosts:
@@ -170,6 +173,13 @@ def manage_scope(add_host=None, add_domain=None, add_cidr=None, approve=None, do
         if add_cidr and add_cidr not in allowed_cidrs:
             allowed_cidrs.append(add_cidr)
             print(f"[✔] Added CIDR to scope: {add_cidr}")
+        if add_code_path:
+            resolved = str(Path(add_code_path).resolve())
+            if resolved not in allowed_code_paths:
+                allowed_code_paths.append(resolved)
+                print(f"[✔] Authorized code path for SAST/SCA: {resolved}")
+            else:
+                print(f"[*] Code path already authorized: {resolved}")
         if approve:
             host = clean_host(approve)
             if host in pending:
@@ -667,6 +677,9 @@ def show_leads(status: str = None, ltype: str = None, limit: int = 20,
     for l in view[:limit]:
         print(f"  [{l.get('confidence')}] {l.get('id')} ({l.get('type')}/{l.get('status')}) "
               f"{l.get('value')}")
+        if l.get("preconditions"):
+            print(f"        ⚙ preconditions: {'; '.join(l['preconditions'])} — "
+                  f"lab-enable then test (set --set-status blocked_precondition if blocked)")
         if l.get("suggested_next"):
             print(f"        ↳ next: {l['suggested_next']}  (src {l.get('source_pointer')})")
 
@@ -768,6 +781,8 @@ if __name__ == "__main__":
     scope_parser.add_argument("--add-host", dest="add_host", help="Authorise a host/IP")
     scope_parser.add_argument("--add-domain", dest="add_domain", help="Authorise a domain/wildcard (e.g. *.example.com)")
     scope_parser.add_argument("--add-cidr", dest="add_cidr", help="Authorise a CIDR range")
+    scope_parser.add_argument("--add-code-path", dest="add_code_path",
+                              help="Authorise a source directory for SAST/SCA (allowed_code_paths)")
     scope_parser.add_argument("--approve", help="Promote a pending host into allowed_hosts")
 
     # add-rationale (WS7: decision journal -> 'How we got here')
@@ -782,11 +797,13 @@ if __name__ == "__main__":
 
     # leads (operator-facing: consume ranked leads instead of raw logs)
     leads_parser = subparsers.add_parser("leads", help="Show/triage ranked leads on the board")
-    leads_parser.add_argument("--status", help="Filter by status (new|testing|confirmed|dead)")
-    leads_parser.add_argument("--type", dest="ltype", help="Filter by type (endpoint|port|subdomain|tech|anomaly|sast)")
+    leads_parser.add_argument("--status", help="Filter by status (new|testing|confirmed|dead|blocked_precondition)")
+    leads_parser.add_argument("--type", dest="ltype",
+                              help="Filter by type (endpoint|port|subdomain|tech|anomaly|sast|cve)")
     leads_parser.add_argument("--limit", type=int, default=20, help="Max leads to show (default: 20)")
     leads_parser.add_argument("--id", dest="lead_id", help="Lead ID to update")
-    leads_parser.add_argument("--set-status", dest="set_status", help="New status for --id")
+    leads_parser.add_argument("--set-status", dest="set_status",
+                              help="New status for --id (new|testing|confirmed|dead|blocked_precondition)")
 
     # sast (white-box: semgrep finds candidates -> sast leads for the verifier)
     sast_parser = subparsers.add_parser("sast", help="Run semgrep over authorised source -> sast leads")
@@ -795,6 +812,25 @@ if __name__ == "__main__":
                              help="semgrep ruleset (default: pinned pack; never 'auto')")
     sast_parser.add_argument("--background", "--bg", action="store_true", dest="background",
                              help="(reserved) run detached; currently synchronous")
+
+    # intel / sca / detect (passive-intel allowlist; never touches the target)
+    intel_parser = subparsers.add_parser(
+        "intel", help="Changelog-first full-index CVE enumeration for a product/version")
+    intel_parser.add_argument("--product", "-P", required=True, help="Product/package name")
+    intel_parser.add_argument("--version", "-V", default="", help="Installed/target version")
+    intel_parser.add_argument("--cpe", default="", help="Optional exact CPE for NVD match")
+    intel_parser.add_argument("--preconditions", default="",
+                              help="Comma-separated feature preconditions for the CVE leads")
+
+    sca_parser = subparsers.add_parser(
+        "sca", help="Distro SCA: inventory jars/lockfiles -> OSV batch -> cve leads (fail-closed on allowed_code_paths)")
+    sca_parser.add_argument("--path", "-p", required=True, help="Directory to inventory")
+    sca_parser.add_argument("--offline", action="store_true",
+                            help="Air-gapped/rate-limited: skip network, file the full pinned inventory as deterministic cve leads")
+
+    detect_parser = subparsers.add_parser(
+        "detect", help="Detect source trees/manifests (analyze auto-wire for SAST+SCA)")
+    detect_parser.add_argument("--path", "-p", default=".")
 
     args = parser.parse_args()
 
@@ -808,7 +844,8 @@ if __name__ == "__main__":
         add_asset_to_board(args.host, args.endpoint, args.port, args.finding, args.details,
                            args.severity, args.status, args.poc, args.evidence_from)
     elif args.subcommand == "scope":
-        manage_scope(args.add_host, args.add_domain, args.add_cidr, args.approve, args.do_list)
+        manage_scope(args.add_host, args.add_domain, args.add_cidr, args.add_code_path,
+                     args.approve, args.do_list)
     elif args.subcommand == "add-rationale":
         add_rationale(args.lead, args.hypothesis, args.why, args.action, args.expected,
                       args.pointer, args.outcome)
@@ -820,3 +857,12 @@ if __name__ == "__main__":
         if args.config:
             run_kwargs["config"] = args.config
         sast.run_sast(args.path, **run_kwargs)
+    elif args.subcommand in ("intel", "sca", "detect"):
+        import intel
+        if args.subcommand == "intel":
+            pres = [p.strip() for p in (args.preconditions or "").split(",") if p.strip()]
+            intel.run_intel(args.product, args.version, args.cpe, pres)
+        elif args.subcommand == "sca":
+            intel.run_sca(args.path, offline=args.offline)
+        else:
+            intel.run_detect(args.path)
