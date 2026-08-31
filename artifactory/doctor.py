@@ -30,6 +30,9 @@ def _engine_root() -> Path:
 _ROOT = _engine_root()
 if str(_ROOT / "core") not in sys.path:
     sys.path.insert(0, str(_ROOT / "core"))
+from registry import path_for as _tool  # noqa: E402
+from bootstrap import register_paths as _register_paths  # noqa: E402
+_register_paths()  # sys.path + PYTHONPATH so spawned tools inherit the layout
 
 
 def _check(name, ok, hint=""):
@@ -113,9 +116,9 @@ def run_doctor(with_suite=False, with_wiring=False):
 
     # 4) knowledge stores present
     stores = {
-        "research library": Path(_engine_dir) / "knowledge" / "sources.json",
-        "payload corpus": Path(_engine_dir) / "payloads" / "index.json",
-        "interaction table": Path(_engine_dir) / "knowledge" / "interactions_local.json",
+        "research library": _ROOT / "knowledge" / "sources.json",
+        "payload corpus": _ROOT / "payloads" / "index.json",
+        "interaction table": _ROOT / "knowledge" / "interactions_local.json",
     }
     for name, path in stores.items():
         results.append(_check(f"knowledge: {name}", path.exists(),
@@ -140,7 +143,7 @@ def run_doctor(with_suite=False, with_wiring=False):
 
     # 7) engine suite (optional — the deeper check)
     if with_suite:
-        rc = subprocess.run([sys.executable, f"{_engine_dir}/eval_engine.py",
+        rc = subprocess.run([sys.executable, _tool("eval_engine"),
                              "suite", "engine"], capture_output=True).returncode
         results.append(_check("engine suite (full machinery)", rc == 0,
                               "run eval_engine.py suite engine --verbose for detail"))

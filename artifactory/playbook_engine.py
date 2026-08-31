@@ -10,10 +10,21 @@ import sys
 from datetime import date
 from pathlib import Path
 
-METHODOLOGY_URLS_FILE = Path(__file__).parent / "knowledge" / "methodology_urls.txt"
 
-PROMPTS_DIR = Path(__file__).parent / "prompts"
-SOURCES_FILE = Path(__file__).parent / "knowledge" / "sources.json"
+def _find_engine_root():
+    p = Path(__file__).resolve()
+    for anc in [p.parent, *p.parents]:
+        if (anc / "art.py").exists():
+            return anc
+    return p.parent
+
+
+_ENGINE_ROOT = _find_engine_root()
+
+METHODOLOGY_URLS_FILE = _ENGINE_ROOT / "knowledge" / "methodology_urls.txt"
+
+PROMPTS_DIR = _ENGINE_ROOT / "prompts"
+SOURCES_FILE = _ENGINE_ROOT / "knowledge" / "sources.json"
 
 
 def get_playbook_path(category: str, name: str) -> Path:

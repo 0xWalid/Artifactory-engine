@@ -32,7 +32,23 @@ from pathlib import Path
 _engine_dir = str(Path(__file__).resolve().parent)
 if _engine_dir not in sys.path:
     sys.path.insert(0, _engine_dir)
+
+
+def _find_engine_root():
+    p = Path(__file__).resolve()
+    for anc in [p.parent, *p.parents]:
+        if (anc / "art.py").exists():
+            return anc
+    return p.parent
+
+
+_ENGINE_ROOT = _find_engine_root()
+if str(_ENGINE_ROOT / "core") not in sys.path:
+    sys.path.insert(0, str(_ENGINE_ROOT / "core"))
 from board_io import json_transaction, load_json, blackboard_dir  # noqa: E402
+from registry import path_for as _tool  # noqa: E402
+from bootstrap import register_paths as _register_paths  # noqa: E402
+_register_paths()  # sys.path + PYTHONPATH so spawned tools inherit the layout
 
 BLACKBOARD_DIR = blackboard_dir()
 LABS = {
@@ -49,7 +65,7 @@ def _sh(cmd, cwd=None):
 
 def _sec_flow(args: str):
     """Run sec_flow.py <args> in THIS workspace; returns (rc, out, err)."""
-    r = _sh(f"{sys.executable} {Path(_engine_dir) / 'sec_flow.py'} {args}",
+    r = _sh(f"{sys.executable} {_tool('sec_flow')} {args}",
             cwd=str(Path.cwd()))
     return r.returncode, r.stdout, r.stderr
 
@@ -141,7 +157,7 @@ def play(lab: str, seed: int = 0, port: int = None):
     # own port: a seeded run passes --port explicitly)
     proc = None
     if not _port_alive(port):
-        cmd = [sys.executable, str(Path(_engine_dir) / meta["module"]),
+        cmd = [sys.executable, _tool(Path(meta["module"]).stem),
                "--port", str(port)]
         if seed and meta["seed_support"]:
             cmd += ["--seed", str(seed)]
@@ -152,7 +168,7 @@ def play(lab: str, seed: int = 0, port: int = None):
 
     # workspace must exist
     if not (BLACKBOARD_DIR / "board.json").exists():
-        _sh(f"{sys.executable} {Path(_engine_dir) / 'init_env.py'} --target .",
+        _sh(f"{sys.executable} {_tool('init_env')} --target .",
             cwd=str(Path.cwd()))
 
     confirmed = 0
@@ -183,14 +199,14 @@ def play(lab: str, seed: int = 0, port: int = None):
             total += 1
             oob_port = 8616
             listener = subprocess.Popen(
-                [sys.executable, str(Path(_engine_dir) / "oob.py"),
+                [sys.executable, _tool('oob'),
                  "listen", "--http-port", str(oob_port)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
             time.sleep(1.0)
             try:
                 # generate a probe via the engine's oob CLI
-                r = _sh(f"{sys.executable} {Path(_engine_dir) / 'oob.py'} generate "
+                r = _sh(f"{sys.executable} {_tool('oob')} generate "
                         f"--host 127.0.0.1 --http-port {oob_port} "
                         f"--purpose 'golden blind ssrf'")
                 m = re.search(r"(http://\S+/oob-[a-f0-9]+/probe)", r.stdout)

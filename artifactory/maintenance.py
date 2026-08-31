@@ -28,7 +28,23 @@ from pathlib import Path
 _engine_dir = str(Path(__file__).resolve().parent)
 if _engine_dir not in sys.path:
     sys.path.insert(0, _engine_dir)
+
+
+def _find_engine_root():
+    p = Path(__file__).resolve()
+    for anc in [p.parent, *p.parents]:
+        if (anc / "art.py").exists():
+            return anc
+    return p.parent
+
+
+_ENGINE_ROOT = _find_engine_root()
+if str(_ENGINE_ROOT / "core") not in sys.path:
+    sys.path.insert(0, str(_ENGINE_ROOT / "core"))
 from board_io import load_json, blackboard_dir  # noqa: E402
+from registry import path_for as _tool  # noqa: E402
+from bootstrap import register_paths as _register_paths  # noqa: E402
+_register_paths()  # sys.path + PYTHONPATH so spawned tools inherit the layout
 
 BLACKBOARD_DIR = blackboard_dir()
 BOARD_FILE = BLACKBOARD_DIR / "board.json"
@@ -149,7 +165,7 @@ def maintenance(run_suite=False, offline=False):
     if run_suite:
         step("5/5 Deterministic engine suite...")
         rc = subprocess.run([sys.executable,
-                             str(Path(_engine_dir) / "eval_engine.py"),
+                             _tool("eval_engine"),
                              "suite", "engine"]).returncode
         if rc == 0:
             print("    [+] suite: ALL PASS")

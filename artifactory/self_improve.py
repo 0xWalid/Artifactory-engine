@@ -44,7 +44,23 @@ _engine_dir = str(Path(__file__).resolve().parent)
 if _engine_dir not in sys.path:
     sys.path.insert(0, _engine_dir)
 
-SOURCE_REPO = Path(_engine_dir).parent          # the git checkout
+
+def _find_engine_root():
+    p = Path(__file__).resolve()
+    for anc in [p.parent, *p.parents]:
+        if (anc / "art.py").exists():
+            return anc
+    return p.parent
+
+
+_ENGINE_ROOT = _find_engine_root()
+if str(_ENGINE_ROOT / "core") not in sys.path:
+    sys.path.insert(0, str(_ENGINE_ROOT / "core"))
+from registry import path_for as _tool  # noqa: E402
+from bootstrap import register_paths as _register_paths  # noqa: E402
+_register_paths()  # sys.path + PYTHONPATH so spawned tools inherit the layout
+
+SOURCE_REPO = _ENGINE_ROOT.parent               # the git checkout
 STABLE_DIR = Path.home() / "artifactory-engine"  # no .git — promoted via install.sh
 KEY_PATH = Path.home() / ".artifactory" / "scope_signing.key"
 CONSENT_NAME = ".selfimprove-consent"            # WORKSPACE ROOT (operator-side)
@@ -166,12 +182,12 @@ def run_gate_steps(candidate_label: str) -> (bool, list):
     for lab, port in (("lab1", 8099), ("lab2", 8100)):
         mod = LAB_MOD[lab]
         procs.append(subprocess.Popen(
-            [sys.executable, str(Path(_engine_dir) / mod), "--port", str(port)],
+            [sys.executable, _tool(Path(mod).stem), "--port", str(port)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True))
     time.sleep(1.5)
     try:
-        r = subprocess.run([sys.executable, f"{_engine_dir}/eval_engine.py",
+        r = subprocess.run([sys.executable, _tool("eval_engine"),
                             "suite", "engine"], capture_output=True, text=True)
         if r.returncode != 0:
             reasons.append(f"suite engine FAILED: {r.stdout[-300:]}")
@@ -179,7 +195,7 @@ def run_gate_steps(candidate_label: str) -> (bool, list):
         reasons.append("suite engine green")
 
         for lab in ("lab1", "lab2"):
-            r = subprocess.run([sys.executable, f"{_engine_dir}/lab_runner.py",
+            r = subprocess.run([sys.executable, _tool("lab_runner"),
                                 "play", lab], capture_output=True, text=True,
                                cwd=str(Path.cwd()))
             if "confirmed" not in r.stdout:

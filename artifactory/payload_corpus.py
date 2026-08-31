@@ -29,7 +29,18 @@ _engine_dir = str(Path(__file__).resolve().parent)
 if _engine_dir not in sys.path:
     sys.path.insert(0, _engine_dir)
 
-PAYLOADS_DIR = Path(_engine_dir) / "payloads"
+
+def _find_engine_root():
+    p = Path(__file__).resolve()
+    for anc in [p.parent, *p.parents]:
+        if (anc / "art.py").exists():
+            return anc
+    return p.parent
+
+
+_ENGINE_ROOT = _find_engine_root()
+
+PAYLOADS_DIR = _ENGINE_ROOT / "payloads"
 INDEX_FILE = PAYLOADS_DIR / "index.json"
 
 # Seed corpus (curated starter set; grows via debrief + operator additions)

@@ -45,7 +45,24 @@ from pathlib import Path
 _engine_dir = str(Path(__file__).resolve().parent)
 if _engine_dir not in sys.path:
     sys.path.insert(0, _engine_dir)
+
+
+def _find_engine_root():
+    """Engine root = the dir containing art.py (works at root or in a package)."""
+    p = Path(__file__).resolve()
+    for anc in [p.parent, *p.parents]:
+        if (anc / "art.py").exists():
+            return anc
+    return p.parent
+
+
+_ENGINE_ROOT = _find_engine_root()
+if str(_ENGINE_ROOT / "core") not in sys.path:
+    sys.path.insert(0, str(_ENGINE_ROOT / "core"))
 from board_io import load_json, blackboard_dir  # noqa: E402
+from registry import path_for as _tool  # noqa: E402  (stem -> abs script path)
+from bootstrap import register_paths as _register_paths  # noqa: E402
+_register_paths()  # sys.path + PYTHONPATH so spawned tools inherit the layout
 
 BLACKBOARD_DIR = blackboard_dir()
 BOARD_FILE = BLACKBOARD_DIR / "board.json"
@@ -167,22 +184,22 @@ def suite_engine(verbose=False):
 
     try:
         # 0) init workspace
-        rc, out, err = _run([PY, f"{_engine_dir}/init_env.py", "--target", str(tmp)])
+        rc, out, err = _run([PY, _tool("init_env"), "--target", str(tmp)])
         check("init_env creates workspace", (tmp / ".blackboard" / "board.json").exists(), err)
 
         # 1) fail-closed scope: example.invalid must be refused
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "run",
+        rc, out, err = _run([PY, _tool("sec_flow"), "run",
                              "--cmd", "curl -s http://example.invalid/", "--target", "example.invalid"],
                             cwd=tmp)
         check("scope gate blocks out-of-scope target", rc != 0 and "SCOPE ERROR" in err, err)
 
         # 2) destructive-action block (in default disallowed_actions)
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "run",
+        rc, out, err = _run([PY, _tool("sec_flow"), "run",
                              "--cmd", "rm -rf /", "--target", "127.0.0.1"], cwd=tmp)
         check("destructive block refuses rm -rf", rc != 0 and "DESTRUCTIVE" in err, err)
 
         # 3) in-scope run + triage: the lab error page must produce an anomaly lead
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "run",
+        rc, out, err = _run([PY, _tool("sec_flow"), "run",
                              "--cmd", "curl -s http://127.0.0.1:8099/api/error",
                              "--target", "127.0.0.1"], cwd=tmp)
         board = load_json(tmp / ".blackboard" / "board.json")
@@ -193,7 +210,7 @@ def suite_engine(verbose=False):
                   for l in anomaly) or bool(anomaly), f"anomaly leads: {[l.get('value') for l in anomaly]}")
 
         # 4) verification gate: confirmed without evidence -> informational
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "add-asset",
+        rc, out, err = _run([PY, _tool("sec_flow"), "add-asset",
                              "--finding", "Unproven claim", "--severity", "high",
                              "--status", "confirmed"], cwd=tmp)
         board = load_json(tmp / ".blackboard" / "board.json")
@@ -202,17 +219,17 @@ def suite_engine(verbose=False):
               f.get("status") == "informational", out + err)
 
         # 5) loop notice on identical command re-run
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "run",
+        rc, out, err = _run([PY, _tool("sec_flow"), "run",
                              "--cmd", "curl -s http://127.0.0.1:8099/api/error",
                              "--target", "127.0.0.1"], cwd=tmp)
         check("loop notice fires on repeat command", "LOOP NOTICE" in err, err)
 
         # 6) role-diff: seed sessions and replay -> BAC delta leads
-        rc, out, err = _run([PY, f"{_engine_dir}/auth_manager.py", "add",
+        rc, out, err = _run([PY, _tool("auth_manager"), "add",
                              "--role", "admin", "--auth-type", "cookie",
                              "--target", "http://127.0.0.1:8099",
                              "--credential", "session=admin-s3ssion"], cwd=tmp)
-        rc2, out2, err2 = _run([PY, f"{_engine_dir}/auth_manager.py", "add",
+        rc2, out2, err2 = _run([PY, _tool("auth_manager"), "add",
                                 "--role", "user", "--auth-type", "cookie",
                                 "--target", "http://127.0.0.1:8099",
                                 "--credential", "session=user-s3ssion"], cwd=tmp)
@@ -225,7 +242,7 @@ def suite_engine(verbose=False):
               all("credential" not in s and "s3ssion" not in json.dumps(s) for s in sess_meta),
               json.dumps(sess_meta))
 
-        rc, out, err = _run([PY, f"{_engine_dir}/auth_manager.py", "role-diff",
+        rc, out, err = _run([PY, _tool("auth_manager"), "role-diff",
                              "--base-url", "http://127.0.0.1:8099",
                              "--roles", "admin,USER_SESS_ID",
                              "--endpoints", str(eps)], cwd=tmp)
@@ -233,7 +250,7 @@ def suite_engine(verbose=False):
         board = load_json(tmp / ".blackboard" / "board.json")
         sids = [s["id"] for s in board.get("sessions", []) if s.get("role") in ("admin", "user")]
         sids = ",".join(sids)
-        rc, out, err = _run([PY, f"{_engine_dir}/auth_manager.py", "role-diff",
+        rc, out, err = _run([PY, _tool("auth_manager"), "role-diff",
                              "--base-url", "http://127.0.0.1:8099",
                              "--roles", sids, "--endpoints", str(eps)], cwd=tmp)
         board = load_json(tmp / ".blackboard" / "board.json")
@@ -243,12 +260,12 @@ def suite_engine(verbose=False):
               any("/admin" in str(l.get("value", "")) for l in rd), f"rolediff: {[l.get('value') for l in rd]}")
 
         # 7) OOB: generate + detached listener + self-callback + attribution
-        rc, out, err = _run([PY, f"{_engine_dir}/oob.py", "generate", "--host", "127.0.0.1",
+        rc, out, err = _run([PY, _tool("oob"), "generate", "--host", "127.0.0.1",
                              "--http-port", "8899", "--purpose", "eval blind ssrf"], cwd=tmp)
         # Start the listener detached ourselves (it blocks forever; the runner's
         # 300s ceiling would kill it mid-suite).
         listener = subprocess.Popen(
-            [PY, f"{_engine_dir}/oob.py", "listen", "--http-port", "8899"],
+            [PY, _tool("oob"), "listen", "--http-port", "8899"],
             cwd=tmp, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1.0)
         state = load_json(tmp / ".blackboard" / "oob_state.json")
@@ -263,7 +280,7 @@ def suite_engine(verbose=False):
             except Exception:
                 pass
             time.sleep(0.5)
-            rc, out, err = _run([PY, f"{_engine_dir}/oob.py", "status"], cwd=tmp)
+            rc, out, err = _run([PY, _tool("oob"), "status"], cwd=tmp)
             board = load_json(tmp / ".blackboard" / "board.json")
             oob_leads = [l for l in board.get("leads", [])
                          if l.get("type") == "anomaly" and "OOB" in str(l.get("value", ""))]
@@ -271,17 +288,17 @@ def suite_engine(verbose=False):
         listener.terminate()
 
         # 8) token accounting: budget + metric
-        rc, out, err = _run([PY, f"{_engine_dir}/tokens.py", "log",
+        rc, out, err = _run([PY, _tool("tokens"), "log",
                              "--role", "operator", "--purpose", "eval suite", "--amount", "50000"],
                             cwd=tmp)
-        rc2, out2, err2 = _run([PY, f"{_engine_dir}/tokens.py", "budget",
+        rc2, out2, err2 = _run([PY, _tool("tokens"), "budget",
                                 "--role", "operator", "--limit", "100000"], cwd=tmp)
-        rc3, out3, err3 = _run([PY, f"{_engine_dir}/tokens.py", "report"], cwd=tmp)
+        rc3, out3, err3 = _run([PY, _tool("tokens"), "report"], cwd=tmp)
         check("token ledger + report work",
               rc == 0 and rc2 == 0 and "50000" in out3 and "NORTH-STAR" in out3, out3 + err3)
 
         # 9) chain edges: link two findings and view chains
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "add-asset",
+        rc, out, err = _run([PY, _tool("sec_flow"), "add-asset",
                              "--finding", "Role leak via /admin", "--severity", "high",
                              "--status", "confirmed", "--poc", "user cookie -> 200 admin panel"],
                             cwd=tmp)
@@ -291,10 +308,10 @@ def suite_engine(verbose=False):
               any(f.get("status") == "confirmed" for f in findings), out + err)
         if len(findings) >= 2:
             f2, f1 = findings[-1], findings[0]
-            rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "chains",
+            rc, out, err = _run([PY, _tool("sec_flow"), "chains",
                                  "--link", f"{f1['id']},{f2['id']}",
                                  "--note", "leak -> role abuse"], cwd=tmp)
-            rc2, out2, err2 = _run([PY, f"{_engine_dir}/sec_flow.py", "chains"], cwd=tmp)
+            rc2, out2, err2 = _run([PY, _tool("sec_flow"), "chains"], cwd=tmp)
             check("chain edge records + chains view", rc == 0 and "leak" in out2.lower(), out2 + err2)
         else:
             check("chain edge records (skipped: <2 findings)", True)
@@ -316,12 +333,12 @@ def suite_engine(verbose=False):
                              "from scope_sig import verify_scope; print(verify_scope())"],
                             cwd=tmp)
         check("tampered scope detected (TAMPERED verdict)", out.strip().startswith("TAMPERED"), out + err)
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "run",
+        rc, out, err = _run([PY, _tool("sec_flow"), "run",
                              "--cmd", "curl -s http://evil.example.com/", "--target", "evil.example.com"],
                             cwd=tmp)
         check("tampered scope refuses commands", rc != 0 and "SIGNATURE" in err, err)
         # Operator-approved scope edit re-signs and verifies again
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "scope",
+        rc, out, err = _run([PY, _tool("sec_flow"), "scope",
                              "--add-host", "127.0.0.99"], cwd=tmp)
         rc, out, err = _run([PY, "-c",
                              "import sys; sys.path.insert(0, " + repr(_engine_dir) + "); "
@@ -334,11 +351,11 @@ def suite_engine(verbose=False):
         scope_doc = json.loads((tmp / ".blackboard" / "scope.json").read_text())
         scope_doc["rate_limit"] = {"min_interval_seconds": 1.0}
         (tmp / ".blackboard" / "scope.json").write_text(json.dumps(scope_doc, indent=2))
-        _run([PY, f"{_engine_dir}/sec_flow.py", "scope", "--add-host", "127.0.0.1"], cwd=tmp)  # re-sign
+        _run([PY, _tool("sec_flow"), "scope", "--add-host", "127.0.0.1"], cwd=tmp)  # re-sign
         t0 = time.time()
-        _run([PY, f"{_engine_dir}/sec_flow.py", "run",
+        _run([PY, _tool("sec_flow"), "run",
               "--cmd", "curl -s http://127.0.0.1:8099/health", "--target", "127.0.0.1"], cwd=tmp)
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "run",
+        rc, out, err = _run([PY, _tool("sec_flow"), "run",
                              "--cmd", "curl -s http://127.0.0.1:8099/health", "--target", "127.0.0.1"],
                             cwd=tmp)
         elapsed = time.time() - t0
@@ -346,17 +363,17 @@ def suite_engine(verbose=False):
               "RATE LIMIT" in err or elapsed >= 1.0, f"elapsed={elapsed:.2f}s err={err[:200]}")
 
         # 12) fingerprint cache: record + lookup + TTL filter
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "fingerprint",
+        rc, out, err = _run([PY, _tool("sec_flow"), "fingerprint",
                              "--host", "127.0.0.1", "--tech", "nginx 1.18.0", "--record"],
                             cwd=tmp)
-        rc2, out2, err2 = _run([PY, f"{_engine_dir}/sec_flow.py", "fingerprint",
+        rc2, out2, err2 = _run([PY, _tool("sec_flow"), "fingerprint",
                                 "--host", "127.0.0.1"], cwd=tmp)
         check("fingerprint records + looks up", rc == 0 and "nginx 1.18.0" in out2, out2 + err2)
 
         # 13) nuclei: binary present or not, the no-silent-drop contract holds either way
         import shutil as _sh
         if _sh.which("nuclei"):
-            rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "nuclei",
+            rc, out, err = _run([PY, _tool("sec_flow"), "nuclei",
                                  "--target", "http://127.0.0.1:8099"], cwd=tmp)
             check("nuclei scan executes (in-scope)", rc == 0, err)
         else:
@@ -372,7 +389,7 @@ def suite_engine(verbose=False):
             mock.chmod(0o755)
             import os as _os
             env = {**_os.environ, "PATH": f"{mock_dir}:{_os.environ['PATH']}"}
-            rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "nuclei",
+            rc, out, err = _run([PY, _tool("sec_flow"), "nuclei",
                                  "--target", "http://127.0.0.1:8099"], cwd=tmp, env=env)
             board = load_json(tmp / ".blackboard" / "board.json")
             nleads = [l for l in board.get("leads", [])
@@ -382,7 +399,7 @@ def suite_engine(verbose=False):
             # And the honest-gap branch with no binary at all:
             env2 = {k: v for k, v in _os.environ.items()}
             env2["PATH"] = "/nonexistent"
-            rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "nuclei",
+            rc, out, err = _run([PY, _tool("sec_flow"), "nuclei",
                                  "--target", "http://127.0.0.1:8099"], cwd=tmp, env=env2)
             board = load_json(tmp / ".blackboard" / "board.json")
             gap = [l for l in board.get("leads", [])
@@ -398,7 +415,7 @@ def suite_engine(verbose=False):
                        "\"DB_PASSWORD\": \"super-db-pass-77\", \"api_key\":\"abcdef98765\"\n"
                        "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----\n"
                        "\n--- STDERR ---\n")
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "inspect",
+        rc, out, err = _run([PY, _tool("sec_flow"), "inspect",
                              "--id", "MSG_REDACTTEST"], cwd=tmp)
         check("inspect redacts cookies + JWTs + JSON secrets + keys",
               "super-secret-cookie-99" not in out and "eyJhbGci" not in out
@@ -406,14 +423,14 @@ def suite_engine(verbose=False):
               and "MIIabc" not in out
               and "__REDACTED" in out, out)
         # Session credential redaction: register a session, then leak its cookie in a log
-        rc, out, err = _run([PY, f"{_engine_dir}/auth_manager.py", "add",
+        rc, out, err = _run([PY, _tool("auth_manager"), "add",
                              "--role", "user", "--auth-type", "cookie",
                              "--target", "http://127.0.0.1:8099",
                              "--credential", "session=t0ps3cr3tLABcookie"], cwd=tmp)
         art2 = tmp / ".blackboard" / "artifacts" / "MSG_REDACT2.log"
         art2.write_text("--- COMMAND ---\nredact test 2\n\n--- STDOUT ---\n"
                         "leaked: session=t0ps3cr3tLABcookie\n\n--- STDERR ---\n")
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "inspect",
+        rc, out, err = _run([PY, _tool("sec_flow"), "inspect",
                              "--id", "MSG_REDACT2"], cwd=tmp)
         check("session credentials redacted from egress",
               "t0ps3cr3tLABcookie" not in out and "__REDACTED" in out, out)
@@ -438,7 +455,7 @@ def suite_engine(verbose=False):
                   False, f"verify_scope returned {out.strip()}")
 
         # 16) crawl: deterministic inventory build against the lab
-        rc, out, err = _run([PY, f"{_engine_dir}/crawl.py", "--base-url",
+        rc, out, err = _run([PY, _tool("crawl"), "--base-url",
                              "http://127.0.0.1:8099", "--max-depth", "1",
                              "--delay", "0.05"], cwd=tmp)
         inv = tmp / "endpoints.txt"
@@ -447,25 +464,25 @@ def suite_engine(verbose=False):
               out + err)
 
         # 17) chain mining: primitive/needs proposals appear deterministically
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "add-asset",
+        rc, out, err = _run([PY, _tool("sec_flow"), "add-asset",
                              "--finding", "Broken access control on /admin — user role reaches admin panel",
                              "--severity", "high", "--status", "confirmed",
                              "--poc", "user cookie -> 200 admin panel"], cwd=tmp)
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "chains", "--mine"],
+        rc, out, err = _run([PY, _tool("sec_flow"), "chains", "--mine"],
                             cwd=tmp)
         check("chain mining proposes primitive/needs edges",
               rc == 0 and ("CHAIN MINING" in out) and ("->" in out), out)
 
         # 19) broad code-path roots are refused (footgun guard)
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "scope",
+        rc, out, err = _run([PY, _tool("sec_flow"), "scope",
                              "--add-code-path", "/tmp"], cwd=tmp)
         check("system-root code path refused", rc != 0 and "too broad" in err, err)
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "scope",
+        rc, out, err = _run([PY, _tool("sec_flow"), "scope",
                              "--add-code-path", str(tmp / "proj")], cwd=tmp)
         check("specific project code path accepted", rc == 0, err)
 
         # 21) status dashboard renders every section
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "status"], cwd=tmp)
+        rc, out, err = _run([PY, _tool("sec_flow"), "status"], cwd=tmp)
         check("status dashboard renders (scope/findings/leads/chains/tokens)",
               rc == 0 and "ENGAGEMENT STATUS" in out and "Findings:" in out
               and "Leads:" in out and "Chains:" in out, out)
@@ -484,7 +501,7 @@ def suite_engine(verbose=False):
             f'<request>{req}</request><status>200</status><response>{resp}</response>'
             '<method>GET</method><url>http://ev.invalid/x</url></item>'
             '</items>')
-        rc, out, err = _run([PY, f"{_engine_dir}/burp_bridge.py", "ingest-history",
+        rc, out, err = _run([PY, _tool("burp_bridge"), "ingest-history",
                              "--file", str(hist)], cwd=tmp)
         inv = tmp / "endpoints.txt"
         check("burp history ingest -> inventory + endpoint leads",
@@ -494,37 +511,37 @@ def suite_engine(verbose=False):
         # 23) researcher behaviors: kev, stack interactions, payload corpus,
         #     variant propagation
         # 23a) payload corpus: init + list + note
-        rc, out, err = _run([PY, f"{_engine_dir}/payload_corpus.py", "list",
+        rc, out, err = _run([PY, _tool("payload_corpus"), "list",
                              "--search", "ssrf"], cwd=tmp)
         check("payload corpus lists seeded classes",
               rc == 0 and "169.254.169.254" in out, out + err)
-        rc, out, err = _run([PY, f"{_engine_dir}/payload_corpus.py", "note",
+        rc, out, err = _run([PY, _tool("payload_corpus"), "note",
                              "--class", "ssrf", "--stack", "nginx",
                              "--worked", "true"], cwd=tmp)
         check("payload corpus records stack wins", rc == 0 and "WORKED" in out, out + err)
 
         # 23b) stack interactions: fingerprint then hypothesize
-        _run([PY, f"{_engine_dir}/sec_flow.py", "fingerprint", "--host", "stack.test.local",
+        _run([PY, _tool("sec_flow"), "fingerprint", "--host", "stack.test.local",
               "--tech", "nginx 1.18", "--record"], cwd=tmp)
-        _run([PY, f"{_engine_dir}/sec_flow.py", "fingerprint", "--host", "stack.test.local",
+        _run([PY, _tool("sec_flow"), "fingerprint", "--host", "stack.test.local",
               "--tech", "Apache Tomcat 9", "--record"], cwd=tmp)
-        rc, out, err = _run([PY, f"{_engine_dir}/stack_interactions.py",
+        rc, out, err = _run([PY, _tool("stack_interactions"),
                              "hypothesize"], cwd=tmp)
         check("stack interactions fires nginx+tomcat hypothesis (no apache/ FP)",
               rc == 0 and "nginx + tomcat" in out
               and "apache/ + tomcat" not in out, out)
         # idempotence: second run adds nothing
-        rc, out, err = _run([PY, f"{_engine_dir}/stack_interactions.py",
+        rc, out, err = _run([PY, _tool("stack_interactions"),
                              "hypothesize"], cwd=tmp)
         check("stack interactions idempotent", rc == 0 and "No NEW" in out, out)
 
         # 23c) variant propagation on confirm (covered in-flow): confirm an IDOR
         #      with endpoints on the board -> variant sweep leads appear
-        _run([PY, f"{_engine_dir}/sec_flow.py", "add-asset",
+        _run([PY, _tool("sec_flow"), "add-asset",
              "--endpoint", "/api/orders/2001"], cwd=tmp)
-        _run([PY, f"{_engine_dir}/sec_flow.py", "add-asset",
+        _run([PY, _tool("sec_flow"), "add-asset",
              "--endpoint", "/api/orders/2002"], cwd=tmp)
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "add-asset",
+        rc, out, err = _run([PY, _tool("sec_flow"), "add-asset",
                              "--finding", "IDOR on /api/orders/2001",
                              "--severity", "medium", "--status", "confirmed",
                              "--poc", "user reads other order"], cwd=tmp)
@@ -536,7 +553,7 @@ def suite_engine(verbose=False):
               and not any("2001" in v["value"] for v in variants), out + err)
 
         # 23d) kev: network-dependent; verify the CLI shape offline (cache-only)
-        rc, out, err = _run([PY, f"{_engine_dir}/kev.py", "list",
+        rc, out, err = _run([PY, _tool("kev"), "list",
                              "--offline", "--limit", "3"], cwd=tmp)
         check("kev CLI functions (offline mode degrades gracefully)",
               rc == 0, out + err)
@@ -552,9 +569,9 @@ def suite_engine(verbose=False):
                             "tokens_spent": 10000,
                             "vulns_per_1M_tokens": 200.0}) + "\n")
         env = {**os.environ, "HOME": str(tmp / "fakehome")}
-        rc, out, err = _run([PY, f"{_engine_dir}/metrics.py", "scan",
+        rc, out, err = _run([PY, _tool("metrics"), "scan",
                              "--root", str(eng_root)], cwd=tmp, env=env)
-        rc2, out2, err2 = _run([PY, f"{_engine_dir}/metrics.py", "show"], cwd=tmp, env=env)
+        rc2, out2, err2 = _run([PY, _tool("metrics"), "show"], cwd=tmp, env=env)
         check("metrics scan+show (global history, sorted)",
               rc == 0 and "2 new score record" in out
               and "wsA-run" in out2 and out2.index("wsA-run") < out2.index("wsB-run"),
@@ -562,23 +579,23 @@ def suite_engine(verbose=False):
 
         # 23f) interaction growth: mining CLI runs offline-cleanly (network is
         # optional; the no-hit path must be a clean exit, not a crash)
-        rc, out, err = _run([PY, f"{_engine_dir}/interaction_growth.py", "mine",
+        rc, out, err = _run([PY, _tool("interaction_growth"), "mine",
                              "--components", "nginx", "--per-component", "1"],
                             cwd=tmp)
         check("interaction growth mining degrades cleanly",
               rc == 0 and ("No new pair proposals" in out or "candidate" in out), out + err)
 
         # 23g) local interaction sidecar loads on top of built-ins
-        kdir = Path(_engine_dir) / "knowledge"
+        kdir = _ENGINE_ROOT / "knowledge"
         local_tbl = kdir / "interactions_local.json"
         had_local = local_tbl.exists()
         if not had_local:
             local_tbl.write_text(json.dumps(
                 [{"a": "testcomp", "b": "", "hypothesis": "suite test entry",
                   "playbook": "test"}]))
-            _run([PY, f"{_engine_dir}/sec_flow.py", "fingerprint", "--host", "side.test",
+            _run([PY, _tool("sec_flow"), "fingerprint", "--host", "side.test",
                   "--tech", "testcomp 1.0", "--record"], cwd=tmp)
-            rc, out, err = _run([PY, f"{_engine_dir}/stack_interactions.py",
+            rc, out, err = _run([PY, _tool("stack_interactions"),
                                  "hypothesize"], cwd=tmp)
             check("local interactions sidecar loads over built-ins",
                   rc == 0 and "testcomp" in out, out)
@@ -588,18 +605,18 @@ def suite_engine(verbose=False):
                   True)
 
         # 23h) component aliasing: broadening + hint
-        rc, out, err = _run([PY, f"{_engine_dir}/component_aliases.py"], cwd=tmp)
+        rc, out, err = _run([PY, _tool("component_aliases")], cwd=tmp)
         check("component aliases map products->embedded",
               rc == 0 and "gitlab" in out.lower(), out + err)
 
         # 23i) fuzz driver: scaffold + grammar-vs-lab (lab /api/fetch is a sink)
-        rc, out, err = _run([PY, f"{_engine_dir}/fuzz_driver.py", "scaffold",
+        rc, out, err = _run([PY, _tool("fuzz_driver"), "scaffold",
                              "--out", str(tmp / "harness.c")], cwd=tmp)
         check("fuzz scaffold generates", rc == 0 and (tmp / "harness.c").exists()
               and "LLVMFuzzerTestOneInput" in (tmp / "harness.c").read_text(), out + err)
         seedf = tmp / "seed.bin"
         seedf.write_bytes(b"{\"url\":\"http://127.0.0.1:8099/health\"}")
-        rc, out, err = _run([PY, f"{_engine_dir}/fuzz_driver.py", "grammar",
+        rc, out, err = _run([PY, _tool("fuzz_driver"), "grammar",
                              "--target", "http://127.0.0.1:8099/api/fetch?url=x",
                              "--seed", str(seedf), "--iterations", "10",
                              "--delay", "0.02"], cwd=tmp)
@@ -607,9 +624,9 @@ def suite_engine(verbose=False):
               rc == 0 and ("anomal" in out.lower() or "survived" in out.lower()), out + err)
 
         # 23j) payload corpus per-line IDs
-        rc, out, err = _run([PY, f"{_engine_dir}/payload_corpus.py", "list",
+        rc, out, err = _run([PY, _tool("payload_corpus"), "list",
                              "--search", "sqli"], cwd=tmp)
-        rc2, out2, err2 = _run([PY, f"{_engine_dir}/payload_corpus.py", "note",
+        rc2, out2, err2 = _run([PY, _tool("payload_corpus"), "note",
                                 "--class", "sqli", "--payload-id", "P2",
                                 "--stack", "mysql", "--worked", "true"], cwd=tmp,
                                 env={**os.environ, "HOME": str(tmp / "fakehome")})
@@ -617,14 +634,14 @@ def suite_engine(verbose=False):
               rc == 0 and "P1." in out and rc2 == 0 and "sqli#P2" in out2, out + out2 + err2)
 
         # 23k) verb matrix: the lab's DELETE-on-read-route vuln must surface
-        _run([PY, f"{_engine_dir}/auth_manager.py", "add", "--role", "user",
+        _run([PY, _tool("auth_manager"), "add", "--role", "user",
               "--auth-type", "cookie", "--target", "http://127.0.0.1:8099",
               "--credential", "session=user-s3ssion"], cwd=tmp)
         board = load_json(tmp / ".blackboard" / "board.json")
         sid = board["sessions"][-1]["id"]
         eps_f = tmp / "vm_eps.txt"
         eps_f.write_text("/api/orders/1001\n")
-        rc, out, err = _run([PY, f"{_engine_dir}/auth_manager.py", "verb-matrix",
+        rc, out, err = _run([PY, _tool("auth_manager"), "verb-matrix",
                              "--base-url", "http://127.0.0.1:8099", "--session", sid,
                              "--endpoints", str(eps_f), "--delay", "0.02"], cwd=tmp)
         check("verb matrix flags over-permissive DELETE (200 on read route)",
@@ -633,7 +650,7 @@ def suite_engine(verbose=False):
         # 23l) timing oracle: same-body slow-response detection path exists
         # (functional timing check is flaky in CI; assert the code path by
         # verifying fetch_as returns elapsed and role-diff runs)
-        rc, out, err = _run([PY, f"{_engine_dir}/auth_manager.py", "role-diff",
+        rc, out, err = _run([PY, _tool("auth_manager"), "role-diff",
                              "--base-url", "http://127.0.0.1:8099",
                              "--roles", sid, "--endpoints", str(eps_f)], cwd=tmp)
         check("role-diff timing-instrumented path executes",
@@ -642,23 +659,23 @@ def suite_engine(verbose=False):
         # 23m) secrets scanner: seeded artifact -> family lead
         (tmp / ".blackboard" / "artifacts" / "MSG_SUITESECRET.log").write_text(
             "--- COMMAND ---\ncurl\n\n--- STDOUT ---\nkey=AKIAIOSFODNN7EXAMPLE\n\n--- STDERR ---\n")
-        rc, out, err = _run([PY, f"{_engine_dir}/secrets.py", "scan"], cwd=tmp)
+        rc, out, err = _run([PY, _tool("secrets"), "scan"], cwd=tmp)
         check("artifact secret scanner files family leads",
               rc == 0 and "aws-access-key" in out, out + err)
 
         # 23n) snapshot + diff: new endpoint becomes a priority lead
-        _run([PY, f"{_engine_dir}/snapshot.py", "snapshot", "--label", "s1"], cwd=tmp)
-        _run([PY, f"{_engine_dir}/sec_flow.py", "add-asset",
+        _run([PY, _tool("snapshot"), "snapshot", "--label", "s1"], cwd=tmp)
+        _run([PY, _tool("sec_flow"), "add-asset",
               "--endpoint", "/brand-new-route"], cwd=tmp)
-        rc, out, err = _run([PY, f"{_engine_dir}/snapshot.py", "diff"], cwd=tmp)
+        rc, out, err = _run([PY, _tool("snapshot"), "diff"], cwd=tmp)
         check("surface diff detects new endpoint since snapshot",
               rc == 0 and "brand-new-route" in out, out)
 
         # 23o) wordlist winnowing: record + winnow split
-        _run([PY, f"{_engine_dir}/wordlist_wins.py", "record"], cwd=tmp)
+        _run([PY, _tool("wordlist_wins"), "record"], cwd=tmp)
         wl = tmp / "wl.txt"
         wl.write_text("admin\nhealth\nzzz-never-seen\n")
-        rc, out, err = _run([PY, f"{_engine_dir}/wordlist_wins.py", "winnow",
+        rc, out, err = _run([PY, _tool("wordlist_wins"), "winnow",
                              "--wordlist", str(wl), "--out", str(tmp / "wl_win.txt")],
                             cwd=tmp)
         won = (tmp / "wl_win.txt").read_text().splitlines()
@@ -678,36 +695,36 @@ def suite_engine(verbose=False):
               rc == 0 and "DUP" in out, out + err)
 
         # 25) operator interop: doctor, cross-index, poc-delta, skeptic ledger, tripwires
-        rc, out, err = _run([PY, f"{_engine_dir}/doctor.py", "--json"],
+        rc, out, err = _run([PY, _tool("doctor"), "--json"],
                             cwd=tmp, env={**os.environ, "HOME": str(tmp / "fakehome")})
         doc = json.loads(out) if out.strip().startswith("[") else []
         check("doctor self-test runs (json mode)",
               rc in (0, 1) and len(doc) >= 5, out[:200])
 
-        rc, out, err = _run([PY, f"{_engine_dir}/cross_index.py", "lookup", "traversal"],
+        rc, out, err = _run([PY, _tool("cross_index"), "lookup", "traversal"],
                             cwd=tmp)
         check("cross-index lookup resolves a class",
               rc == 0 and "CLASS CROSS-INDEX" in out and "traversal" in out.lower(), out[:200])
 
-        rc, out, err = _run([PY, f"{_engine_dir}/cross_index.py", "map"], cwd=tmp)
+        rc, out, err = _run([PY, _tool("cross_index"), "map"], cwd=tmp)
         check("coverage map renders class x store",
               rc == 0 and "COVERAGE MAP" in out and "BLIND SPOTS" in out, out[:200])
 
-        rc, out, err = _run([PY, f"{_engine_dir}/skeptic_ledger.py", "record",
+        rc, out, err = _run([PY, _tool("skeptic_ledger"), "record",
                              "--finding", "FINDING_TEST", "--verdict", "survives"],
                             cwd=tmp, env={**os.environ, "HOME": str(tmp / "fakehome")})
-        rc2, out2, _ = _run([PY, f"{_engine_dir}/skeptic_ledger.py", "stats"],
+        rc2, out2, _ = _run([PY, _tool("skeptic_ledger"), "stats"],
                             cwd=tmp, env={**os.environ, "HOME": str(tmp / "fakehome")})
         check("skeptic ledger records + renders",
               rc == 0 and "logged" in out, out + out2)
 
-        rc, out, err = _run([PY, f"{_engine_dir}/tripwires.py", "plant"], cwd=tmp)
-        rc2, out2, _ = _run([PY, f"{_engine_dir}/tripwires.py", "check"], cwd=tmp)
+        rc, out, err = _run([PY, _tool("tripwires"), "plant"], cwd=tmp)
+        rc2, out2, _ = _run([PY, _tool("tripwires"), "check"], cwd=tmp)
         check("tripwires plant + full-chain check",
               rc == 0 and "planted" in out and "TRIPWIRE CHECK" in out2, out + out2)
 
         # greenhouse acceptance: known-good playbook class accepts
-        rc, out, err = _run([PY, f"{_engine_dir}/eval_engine.py", "acceptance",
+        rc, out, err = _run([PY, _tool("eval_engine"), "acceptance",
                              "--category", "sast", "--name", "ssrf",
                              "--port", "8901"], cwd=tmp)
         check("greenhouse acceptance ACCEPTS a matching playbook",
@@ -720,8 +737,8 @@ def suite_engine(verbose=False):
         import os as _os2
         fakehome = _tf.mkdtemp(prefix="sba_cmdhome_")
         env = {**_os2.environ, "HOME": fakehome}
-        rc = _sp2.run(["bash", str(Path(_engine_dir).parent / "install.sh")],
-                     cwd=str(Path(_engine_dir).parent), env=env,
+        rc = _sp2.run(["bash", str(_ENGINE_ROOT.parent / "install.sh")],
+                     cwd=str(_ENGINE_ROOT.parent), env=env,
                      capture_output=True, text=True, timeout=300).returncode
         cmd_dir = Path(fakehome) / ".config" / "opencode" / "commands"
         expected_files = ["analyze", "test", "intel", "scan-code", "research",
@@ -755,7 +772,7 @@ def suite_engine(verbose=False):
         check("A1: shared preamble emitted into every file",
               not no_preamble, f"missing preamble: {no_preamble}")
         # A2: install.sh contains exactly ONE sed rewrite pass
-        inst_src = (Path(_engine_dir).parent / "install.sh").read_text()
+        inst_src = (_ENGINE_ROOT.parent / "install.sh").read_text()
         sed_count = inst_src.count('sed -i "s|~/artifactory|$ENGINE|g"')
         check("A2: install.sh has exactly one sed pass (no duplicate block)",
               sed_count == 1, f"sed passes: {sed_count}")
@@ -776,7 +793,7 @@ def suite_engine(verbose=False):
         # CONSTRUCTED at runtime (never a literal in this file) so the check
         # cannot accidentally "document" it by mentioning it.
         _orph = "orphan" + "_probe" + "_x9"
-        inst_txt = (Path(_engine_dir).parent / "install.sh").read_text()
+        inst_txt = (_ENGINE_ROOT.parent / "install.sh").read_text()
         eval_txt = (Path(_engine_dir) / "eval_engine.py").read_text()
         planted_is_orphan = (_orph not in inst_txt
                              and _orph not in eval_txt
@@ -800,12 +817,12 @@ def suite_engine(verbose=False):
         (scratch2 / ".blackboard" / "models.json").write_text(json.dumps(
             {"cheap": {"base_url": "http://localhost:11434/v1",
                        "model": "llama3", "api_key_env": ""}}))
-        rc, out, err = _run([PY, f"{_engine_dir}/model_router.py", "show",
+        rc, out, err = _run([PY, _tool("model_router"), "show",
                               "--role", "skeptic"], cwd=scratch2)
         check("B0: unset tier falls back to cheaper working tier",
               rc == 0 and "FALLBACK" in out and "cheap" in out, out + err)
         # never-blocks: empty config -> deterministic-only, exit 0
-        rc, out, err = _run([PY, f"{_engine_dir}/model_router.py", "show",
+        rc, out, err = _run([PY, _tool("model_router"), "show",
                              "--role", "exploit"], cwd=tmp)
         check("B0: no config -> deterministic-only (never blocks)",
               rc == 0 and "deterministic-only" in out, out + err)
@@ -813,18 +830,18 @@ def suite_engine(verbose=False):
         # 27d) B1: chain planner — seeded 4-finding graph plans data_exfil
         b1 = tmp / "b1ws"
         b1.mkdir()
-        rc = _run([PY, f"{_engine_dir}/init_env.py", "--target", str(b1)],
+        rc = _run([PY, _tool("init_env"), "--target", str(b1)],
                   cwd=b1) if False else None
         # init via cwd (init_env writes into the target dir)
-        _run([PY, f"{_engine_dir}/init_env.py", "--target", "."], cwd=b1)
+        _run([PY, _tool("init_env"), "--target", "."], cwd=b1)
         for title in ["API token leak in verbose error log",
                       "Auth bypass on /admin via header trust",
                       "IDOR on /api/orders allows reading other users' orders",
                       "Data reach: order dump endpoint exposes all records"]:
-            _run([PY, f"{_engine_dir}/sec_flow.py", "add-asset",
+            _run([PY, _tool("sec_flow"), "add-asset",
                   "--finding", title, "--severity", "high",
                   "--status", "confirmed", "--poc", "seed"], cwd=b1)
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "chains",
+        rc, out, err = _run([PY, _tool("sec_flow"), "chains",
                              "--plan", "--goal", "data_exfil"], cwd=b1)
         has3hop = "3 hop" in out
         check("B1: plan data_exfil returns a >=3-hop ranked path",
@@ -842,8 +859,8 @@ def suite_engine(verbose=False):
         # no-path clean exit
         b1b = tmp / "b1empty"
         b1b.mkdir()
-        _run([PY, f"{_engine_dir}/init_env.py", "--target", "."], cwd=b1b)
-        rc, out, err = _run([PY, f"{_engine_dir}/sec_flow.py", "chains",
+        _run([PY, _tool("init_env"), "--target", "."], cwd=b1b)
+        rc, out, err = _run([PY, _tool("sec_flow"), "chains",
                              "--plan", "--goal", "RCE"], cwd=b1b)
         check("B1: no-path graph returns 'no chain to goal' cleanly",
               rc == 0 and "no chain to goal" in out, out + err)
@@ -859,7 +876,7 @@ def suite_engine(verbose=False):
             "why": "test edge", "confidence": 0.6, "source": "deterministic",
             "created_at": "now"})
         (b1 / ".blackboard" / "board.json").write_text(json.dumps(b1board, indent=2))
-        rc, out, err = _run([PY, f"{_engine_dir}/report_engine.py"], cwd=b1)
+        rc, out, err = _run([PY, _tool("report_engine")], cwd=b1)
         summary_txt = (b1 / "reports" / "SUMMARY.md").read_text()
         check("B1: SUMMARY separates Hypothesized paths + resolves LEAD labels",
               "Hypothesized Paths" in summary_txt
@@ -868,8 +885,8 @@ def suite_engine(verbose=False):
 
         # 27e) A4: planner agent registered with the chains --plan contract
         fakehome2 = _tf.mkdtemp(prefix="sba_planner_")
-        _sp2.run(["bash", str(Path(_engine_dir).parent / "install.sh")],
-                 cwd=str(Path(_engine_dir).parent),
+        _sp2.run(["bash", str(_ENGINE_ROOT.parent / "install.sh")],
+                 cwd=str(_ENGINE_ROOT.parent),
                  env={**_os2.environ, "HOME": fakehome2},
                  capture_output=True, text=True, timeout=300)
         planner_f = Path(fakehome2) / ".config" / "opencode" / "agents" / "planner.md"
@@ -909,8 +926,8 @@ def suite_engine(verbose=False):
         b2env = {**os.environ, "HOME": str(b2home)}
         b2ws = tmp / "b2ws"
         b2ws.mkdir()
-        _run([PY, f"{_engine_dir}/init_env.py", "--target", "."], cwd=b2ws, env=b2env)
-        rc, out, err = _run([PY, f"{_engine_dir}/mcp_broker.py", "call",
+        _run([PY, _tool("init_env"), "--target", "."], cwd=b2ws, env=b2env)
+        rc, out, err = _run([PY, _tool("mcp_broker"), "call",
                              "--server", "mock", "--tool", "fetch_url",
                              "--args", '{"url":"http://127.0.0.1/x"}'],
                             cwd=b2ws, env=b2env)
@@ -922,7 +939,7 @@ def suite_engine(verbose=False):
               and "AKIAIMOCKSECRETKEY9999" not in b2board
               and "__REDACTED__" in out, out[:300] + err[:200])
         # describe: arg names + types only (no doc schema in output)
-        rc, out, err = _run([PY, f"{_engine_dir}/mcp_broker.py", "describe",
+        rc, out, err = _run([PY, _tool("mcp_broker"), "describe",
                              "--tool", "fetch_url"], cwd=b2ws, env=b2env)
         check("B2: describe emits arg names+types only (no schema docs)",
               rc == 0 and "url: string (required)" in out
@@ -932,7 +949,7 @@ def suite_engine(verbose=False):
             {"servers": {"mock": {"transport": "stdio",
                                   "command": [PY, str(mock_srv)],
                                   "capabilities": ["net"], "approved": True}}}))
-        rc, out, err = _run([PY, f"{_engine_dir}/mcp_broker.py", "call",
+        rc, out, err = _run([PY, _tool("mcp_broker"), "call",
                              "--server", "mock", "--tool", "fetch_url",
                              "--args", "{}"], cwd=b2ws, env=b2env)
         check("B2: net-capable server refuses target-less call (no passive bypass)",
@@ -942,7 +959,7 @@ def suite_engine(verbose=False):
             {"servers": {"mock": {"transport": "stdio",
                                   "command": [PY, str(mock_srv)],
                                   "capabilities": ["local"], "approved": False}}}))
-        rc, out, err = _run([PY, f"{_engine_dir}/mcp_broker.py", "call",
+        rc, out, err = _run([PY, _tool("mcp_broker"), "call",
                              "--server", "mock", "--tool", "fetch_url",
                              "--args", "{}"], cwd=b2ws, env=b2env)
         check("B2: unapproved server is unusable (allowlist)",
@@ -1003,7 +1020,7 @@ def suite_engine(verbose=False):
               r_ok2 is False and "mismatch" in r_why2.lower(), f"{r_ok2} {r_why2}")
 
         # 28) report engine renders chain paths in SUMMARY
-        rc, out, err = _run([PY, f"{_engine_dir}/report_engine.py"], cwd=tmp)
+        rc, out, err = _run([PY, _tool("report_engine")], cwd=tmp)
         summary = (tmp / "reports" / "SUMMARY.md")
         check("report renders attack paths + advisories",
               summary.exists() and "Attack Paths" in summary.read_text()

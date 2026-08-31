@@ -31,7 +31,18 @@ _engine_dir = str(Path(__file__).resolve().parent)
 if _engine_dir not in sys.path:
     sys.path.insert(0, _engine_dir)
 
-LOCAL_TABLE = Path(_engine_dir) / "knowledge" / "interactions_local.json"
+
+def _find_engine_root():
+    p = Path(__file__).resolve()
+    for anc in [p.parent, *p.parents]:
+        if (anc / "art.py").exists():
+            return anc
+    return p.parent
+
+
+_ENGINE_ROOT = _find_engine_root()
+
+LOCAL_TABLE = _ENGINE_ROOT / "knowledge" / "interactions_local.json"
 
 # Component vocabulary: the names we mine for + the aliases seen in advisories.
 COMPONENTS = [

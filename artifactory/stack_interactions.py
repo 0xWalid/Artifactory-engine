@@ -30,6 +30,7 @@ _engine_dir = str(Path(__file__).resolve().parent)
 if _engine_dir not in sys.path:
     sys.path.insert(0, _engine_dir)
 from board_io import json_transaction, load_json, blackboard_dir  # noqa: E402
+from bootstrap import engine_root  # noqa: E402
 
 BLACKBOARD_DIR = blackboard_dir()
 BOARD_FILE = BLACKBOARD_DIR / "board.json"
@@ -37,7 +38,7 @@ FINGERPRINTS_FILE = BLACKBOARD_DIR / "fingerprints.json"
 
 # Operator-growth sidecar: approved entries mined by interaction_growth.py
 # load ON TOP of the built-ins (never silently; the file is a readable diff).
-LOCAL_TABLE = Path(_engine_dir) / "knowledge" / "interactions_local.json"
+LOCAL_TABLE = engine_root() / "knowledge" / "interactions_local.json"
 
 
 def _load_interactions() -> list:

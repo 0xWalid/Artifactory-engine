@@ -25,13 +25,14 @@ _engine_dir = str(Path(__file__).resolve().parent)
 if _engine_dir not in sys.path:
     sys.path.insert(0, _engine_dir)
 from board_io import blackboard_dir  # noqa: E402
+from bootstrap import engine_root  # noqa: E402
 import playbook_engine as pe  # noqa: E402
 
 BLACKBOARD_DIR = blackboard_dir()
 DEADENDS = Path.home() / ".artifactory" / "deadends.jsonl"
 PB_RATES = Path.home() / ".artifactory" / "playbook_confirm_rates.json"
 LINEAGE = Path.home() / ".artifactory" / "source_lineage.json"
-PAYLOAD_INDEX = Path(_engine_dir) / "payloads" / "index.json"
+PAYLOAD_INDEX = engine_root() / "payloads" / "index.json"
 
 # class aliases -> canonical class token (the join key across stores)
 CLASS_ALIASES = {
