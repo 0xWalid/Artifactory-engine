@@ -1,0 +1,8 @@
+X-Role: admin
+X-Original-URL: /admin
+X-Rewrite-URL: /admin
+X-Forwarded-For: 127.0.0.1
+X-Forwarded-Host: localhost
+X-Custom-IP-Authorization: 127.0.0.1
+Referer: /admin
+role=admin&isAdmin=true&admin=1

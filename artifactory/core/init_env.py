@@ -77,6 +77,19 @@ def init_target_workspace(target_dir: Path, scope_from: Path = None):
             }
         scope_file.write_text(json.dumps(initial_scope, indent=2))
         print(f"[+] Created: {scope_file.name}")
+        # Tamper evidence: sign the authorization fields (key lives outside
+        # the workspace at ~/.artifactory/scope_signing.key, 0600). Pass the
+        # TARGET workspace's paths explicitly — init may run with a different
+        # CWD than --target.
+        try:
+            import scope_sig
+            created = scope_sig.create_key_if_missing()
+            if created:
+                print("[+] Created scope signing key (~/.artifactory/scope_signing.key, 0600)")
+            scope_sig.sign_scope(blackboard_dir / "scope.json")
+            print(f"[+] Signed: {scope_file.name} -> {blackboard_dir}/scope.sig")
+        except Exception as e:
+            print(f"[!] Scope signing unavailable ({e}) — workspace runs unsigned (tamper evidence off).")
     else:
         print(f"[*] Exists (Skipped): {scope_file.name}")
 

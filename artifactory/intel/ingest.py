@@ -10,7 +10,16 @@ import re
 import sys
 from pathlib import Path
 
-PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+def _find_engine_root():
+    p = Path(__file__).resolve()
+    for anc in [p.parent, *p.parents]:
+        if (anc / "art.py").exists():
+            return anc
+    return p.parent
+
+
+PROMPTS_DIR = _find_engine_root() / "prompts"
 
 
 def strip_and_parameterize(raw_text: str, custom_target: str = None) -> str:

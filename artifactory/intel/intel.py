@@ -409,6 +409,7 @@ def run_intel(product: str, version: str = "", cpe: str = "", preconditions: lis
     """FULL-INDEX + CHANGELOG-FIRST enumeration for one product/version."""
     preconditions = preconditions or []
     candidates = {}  # cve_id -> summary
+    fix_refs_by_cve = {}  # cve_id -> [fix commit / advisory URLs] (patch auto-chain)
 
     if cpe:
         print(f"[*] Querying NVD index for CPE {cpe} ...")
@@ -441,6 +442,17 @@ def run_intel(product: str, version: str = "", cpe: str = "", preconditions: lis
             cve_id = aliases[0] if aliases else vid
             summary = (vuln.get("summary") or vuln.get("details") or "")[:220]
             candidates[cve_id] = summary
+            # CVE -> patch auto-chain: OSV references often carry the FIX
+            # commit / advisory link. Capture them so patch_diff can hunt
+            # variants from the actual fix ("read the diff, not the advisory").
+            fix_refs = []
+            for ref in vuln.get("references", []) or []:
+                rtype = (ref.get("type") or "").upper()
+                url = ref.get("url", "")
+                if url and rtype in ("FIX", "GIT", "WEB") and "github.com" in url or rtype == "FIX":
+                    fix_refs.append(url)
+            if fix_refs:
+                fix_refs_by_cve.setdefault(cve_id, fix_refs[:3])
 
     # NVD keyword fallback catches CPE-only products OSV lacks (e.g. appliances).
     # Two stages: precise "<product> <version>" first; if the version string
@@ -457,13 +469,32 @@ def run_intel(product: str, version: str = "", cpe: str = "", preconditions: lis
         candidates.setdefault(hit["id"], hit["summary"])
 
     leads = []
+    # Component aliasing: appliances embed components (nginx-in-artifactory etc);
+    # a product-name pass misses embedded-component CVEs, so hint the broadening.
+    alias_hint = ""
+    try:
+        from component_aliases import alias_hint as _ah
+        alias_hint = _ah(product)
+    except Exception:
+        pass
     for cid, summary in sorted(candidates.items()):
         if cid.startswith("GAP-"):
             continue
+        refs = fix_refs_by_cve.get(cid, [])
+        hint = ""
+        if refs:
+            hint = (f" | fix-ref: {refs[0]} — feed patch_diff.py --diff with the "
+                    f"commit .patch/.diff URL to hunt variants on YOUR surface")
+        if alias_hint:
+            hint += alias_hint
         leads.append(make_cve_lead(
             f"{product} {version or ''}: {cid}".strip(),
             summary, label_to_pointer(f"intel-{product}-{version}-{cid}"),
             preconditions=preconditions,
+            suggested_next=(
+                "changelog-first: read the vendor release notes for the first patched "
+                "release; verify the version condition holds at runtime; then build a PoC"
+            ) + hint,
         ))
     _emit_leads(leads, f"intel({product} {version or ''})")
 

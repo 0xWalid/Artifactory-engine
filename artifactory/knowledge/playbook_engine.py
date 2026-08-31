@@ -10,10 +10,21 @@ import sys
 from datetime import date
 from pathlib import Path
 
-METHODOLOGY_URLS_FILE = Path(__file__).parent / "knowledge" / "methodology_urls.txt"
 
-PROMPTS_DIR = Path(__file__).parent / "prompts"
-SOURCES_FILE = Path(__file__).parent / "knowledge" / "sources.json"
+def _find_engine_root():
+    p = Path(__file__).resolve()
+    for anc in [p.parent, *p.parents]:
+        if (anc / "art.py").exists():
+            return anc
+    return p.parent
+
+
+_ENGINE_ROOT = _find_engine_root()
+
+METHODOLOGY_URLS_FILE = _ENGINE_ROOT / "knowledge" / "methodology_urls.txt"
+
+PROMPTS_DIR = _ENGINE_ROOT / "prompts"
+SOURCES_FILE = _ENGINE_ROOT / "knowledge" / "sources.json"
 
 
 def get_playbook_path(category: str, name: str) -> Path:
@@ -35,6 +46,95 @@ def playbook_path_for_source(s: dict) -> Path:
 def source_is_built(s: dict) -> bool:
     """True if a playbook already exists on disk for this source."""
     return playbook_path_for_source(s).exists()
+
+
+# --------------------------------------------------------------- freshness
+# The library is a LIVE research index, not a frozen snapshot: each source's
+# page content-hash is recorded at synthesis time; a cheap fetch + hash check
+# (zero LLM tokens) re-flags changed sources as pending so they get re-read
+# and re-synthesized. Tradecraft has a freshness half-life; this is how the
+# engine notices.
+
+import hashlib
+import urllib.request
+
+
+def _fetch_url_hash(url: str, timeout: int = 15) -> str:
+    """Cheap content hash of a source page (first 512KB). Empty on failure —
+    never blocks: an unfetchable source just isn't refreshed this cycle."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "artifactory-freshness/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(512 * 1024)
+        return hashlib.sha256(body).hexdigest()
+    except Exception:
+        return ""
+
+
+def source_content_hash(s: dict) -> str:
+    return s.get("content_hash", "") or ""
+
+
+def refresh_source_hashes(verbose=True) -> list:
+    """Re-hash every source whose playbook is already built. A changed hash
+    re-flags the source (records pending_reason=content-changed) so
+    `--pending` re-queues it for re-synthesis. Returns list of changed ids."""
+    sources = load_sources()
+    changed = []
+    for s in sources:
+        if not source_is_built(s):
+            continue  # not built yet -> already pending, nothing to refresh
+        new_hash = _fetch_url_hash(s.get("url", ""))
+        if not new_hash:
+            continue  # fetch failed this cycle; keep the old state
+        old_hash = source_content_hash(s)
+        if old_hash and new_hash != old_hash:
+            s["pending_reason"] = "content-changed"
+            changed.append(s.get("id") or s.get("title") or s.get("url"))
+        s["content_hash"] = new_hash
+        s["hash_at"] = date.today().isoformat()
+    if changed:
+        save_sources(sources)
+        if verbose:
+            print(f"[✔] {len(changed)} source(s) changed since synthesis — "
+                  f"re-queued for re-synthesis: {', '.join(changed[:8])}"
+                  + (" ..." if len(changed) > 8 else ""))
+            print("    Re-build with: playbook_engine.py --sources-json --pending")
+    elif verbose:
+        print(f"[*] All built sources unchanged ({len(sources)} checked).")
+    return changed
+
+
+def sources_needing_rebuild(sources: list) -> list:
+    """Pending = not built, OR built but flagged content-changed. Used by
+    --pending so freshness rides the existing token-efficient worklist."""
+    out = []
+    for s in sources:
+        if not source_is_built(s) or s.get("pending_reason") == "content-changed":
+            out.append(s)
+    return out
+
+
+# --------------------------------------------------------------- quality tiers
+# Primary research (Kettle/Tsai/Project Zero) > advisories > disclosed reports
+# > guides. discover proposes by tier; synthesis effort scales with tier.
+SOURCE_TIERS = ["primary", "advisory", "report", "guide"]
+
+
+def infer_tier(s: dict) -> str:
+    """Deterministic tier from existing metadata (url + type); only falls back
+    to 'report'. No opinionated curation — just what the registry already says."""
+    if s.get("tier") in SOURCE_TIERS:
+        return s["tier"]
+    t = (s.get("type") or "").lower()
+    url = (s.get("url") or "").lower()
+    if t in ("research", "talk"):
+        return "primary"
+    if "advisory" in t or "cve" in t or "ghsa" in url or "nvd.nist" in url:
+        return "advisory"
+    if "guide" in t or "cheatsheet" in url or "owasp.org" in url:
+        return "guide"
+    return "report"
 
 
 def render_playbook(content: str, target: str = "", auth_token: str = "") -> str:
@@ -60,6 +160,17 @@ def load_sources() -> list:
         return json.loads(SOURCES_FILE.read_text()).get("sources", [])
     except Exception:
         return []
+
+
+def save_sources(sources: list):
+    """Persist the library back, preserving any top-level metadata keys."""
+    try:
+        doc = json.loads(SOURCES_FILE.read_text())
+    except Exception:
+        doc = {}
+    doc["sources"] = sources
+    doc["updated"] = date.today().isoformat()
+    SOURCES_FILE.write_text(json.dumps(doc, indent=1, ensure_ascii=False) + "\n")
 
 
 def suggest_sources(category: str, name: str, limit: int = 8) -> str:
@@ -110,7 +221,9 @@ def suggest_sources(category: str, name: str, limit: int = 8) -> str:
 
 
 def save_researched_playbook(category: str, name: str, content: str, author: str = "Synthesized Tradecraft") -> Path:
-    """Saves newly researched tradecraft into the local playbook repository."""
+    """Saves newly researched tradecraft into the local playbook repository.
+    If the playbook corresponds to a registry source, the source's page hash is
+    recorded NOW so future --refresh cycles can detect content changes."""
     target_path = get_playbook_path(category, name)
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -119,6 +232,22 @@ def save_researched_playbook(category: str, name: str, content: str, author: str
     header += f"**Category:** {category}\n\n"
 
     target_path.write_text(header + content.strip())
+
+    # Freshness anchor: stamp the source whose playbook this is.
+    try:
+        sources = load_sources()
+        sid = name  # save_name convention = source id (or title)
+        for s in sources:
+            if (s.get("id") or s.get("title")) == sid and s.get("url"):
+                h = _fetch_url_hash(s["url"])
+                if h:
+                    s["content_hash"] = h
+                    s["hash_at"] = date.today().isoformat()
+                    s.pop("pending_reason", None)  # freshly rebuilt
+                break
+        save_sources(sources)
+    except Exception:
+        pass
     return target_path
 
 
@@ -309,7 +438,9 @@ if __name__ == "__main__":
     parser.add_argument("--export-urls", action="store_true", dest="export_urls",
                         help="(Re)generate knowledge/methodology_urls.txt from sources.json")
     parser.add_argument("--pending", action="store_true",
-                        help="With --sources-json/--export-urls: emit ONLY sources whose playbook does not yet exist on disk (token-efficient worklist)")
+                        help="With --sources-json/--export-urls: emit ONLY not-yet-built or content-changed sources (token-efficient worklist)")
+    parser.add_argument("--refresh", action="store_true",
+                        help="Re-hash built sources' pages; changed ones re-queue for re-synthesis (cheap, no LLM)")
     parser.add_argument("--add-source", dest="add_source_url", default=None,
                         help="Add a source URL to the registry (requires --title + --category)")
     parser.add_argument("--title", default=None, help="Title for --add-source")
@@ -323,23 +454,31 @@ if __name__ == "__main__":
 
     if args.sources_json:
         sources = load_sources()
+        # Freshness-aware pending list: not-built OR flagged content-changed.
+        rebuild_ids = {s.get("id") for s in sources_needing_rebuild(sources)}
         out = []
         for s in sources:
             if args.category and args.category not in s.get("category", []):
                 continue
             built = source_is_built(s)
-            if args.pending and built:
+            stale = s.get("id") in rebuild_ids and built
+            if args.pending and built and not stale:
                 continue
             cats = s.get("category") or ["misc"]
             out.append(
                 {"id": s.get("id"), "title": s.get("title"), "url": s.get("url"),
                  "category": s.get("category", []), "authors": s.get("authors", []),
-                 "tags": s.get("tags", []),
+                 "tags": s.get("tags", []), "tier": infer_tier(s),
                  "save_category": cats[0], "save_name": s.get("id") or s.get("title"),
                  "playbook": str(playbook_path_for_source(s).relative_to(PROMPTS_DIR.parent)),
-                 "built": built}
+                 "built": built, "stale": stale,
+                 **({"pending_reason": s.get("pending_reason")} if s.get("pending_reason") else {})}
             )
         print(json.dumps(out, ensure_ascii=False))
+        sys.exit(0)
+
+    if args.refresh:
+        refresh_source_hashes(verbose=True)
         sys.exit(0)
 
     if args.add_source_url:
