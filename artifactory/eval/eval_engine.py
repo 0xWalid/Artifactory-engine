@@ -897,7 +897,7 @@ def suite_engine(verbose=False):
         exploit_f = Path(fakehome2) / ".config" / "opencode" / "agents" / "exploit.md"
         et = exploit_f.read_text() if exploit_f.exists() else ""
         check("A5: exploit agent references corpus payloads + model routing",
-              "payload_corpus.py" in et and "model_router.py" in et, et[:150])
+              "art.py payload_corpus" in et and "art.py model_router" in et, et[:150])
         _shutil_rmtree(fakehome2)
 
         # 27f) B2: MCP broker against a MOCK stdio server — pointer + lead,
