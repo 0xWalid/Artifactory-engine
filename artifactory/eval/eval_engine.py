@@ -1026,6 +1026,36 @@ def suite_engine(verbose=False):
               summary.exists() and "Attack Paths" in summary.read_text()
               and list((tmp / "reports").glob("FINDING_*.md")), err)
 
+        # 29) STRUCTURE (microkernel): the registry resolves every tool stem to
+        # a real file, the art dispatcher boots + routes by stem (unknown -> 2),
+        # and no brittle interpolated engine-dir deep path was reintroduced (the
+        # exact string-path brittleness this package layout was built to remove).
+        from registry import all_tools as _all_tools
+        art = _ENGINE_ROOT / "art.py"
+        unresolved = [s for s in _all_tools() if not Path(_tool(s)).is_file()]
+        check("structure: registry resolves every tool stem to a real file",
+              art.is_file() and bool(_all_tools()) and not unresolved,
+              f"art={art.is_file()} unresolved={unresolved[:5]}")
+        rc_u, out_u, err_u = _run([PY, str(art), "__no_such_tool__"])
+        rc_h, out_h, err_h = _run([PY, str(art)])
+        check("structure: art dispatcher boots + routes by stem",
+              rc_u == 2 and "unknown tool" in (out_u + err_u)
+              and rc_h == 0 and "sec_flow" in out_h,
+              f"unknown_rc={rc_u} usage_rc={rc_h}")
+        _brittle = []
+        import re as _re
+        # Build the pattern from fragments so this detector never matches its
+        # own source; the whole point is to fail if a subprocess path is again
+        # hardcoded as an interpolated engine-dir string instead of path_for().
+        _brittle_pat = r'\{' + '_engine_dir' + r'\}/[A-Za-z0-9_./-]*' + r'\.py'
+        for _py in _ENGINE_ROOT.rglob("*.py"):
+            if "__pycache__" in _py.parts:
+                continue
+            if _re.search(_brittle_pat, _py.read_text()):
+                _brittle.append(_py.name)
+        check("structure: no brittle interpolated engine-dir deep paths in tree",
+              not _brittle, f"brittle: {_brittle[:5]}")
+
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
