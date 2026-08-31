@@ -55,6 +55,11 @@ mkdir -p "$ENGINE/.blackboard/artifacts"
 mkdir -p "$OPENCODE_CMD_DIR"
 mkdir -p "$OPENCODE_AGENT_DIR"
 
+# Prune the deprecated monolithic command (pre-consolidation). It was replaced
+# by 15 per-workflow files and still points at old flat module paths; targeted
+# removal only — the commands dir may hold the operator's own OpenCode commands.
+rm -f "$OPENCODE_CMD_DIR/artifactory.md"
+
 for cat in recon web auth infra logic chaining sast; do
     mkdir -p "$ENGINE/prompts/$cat"
 done

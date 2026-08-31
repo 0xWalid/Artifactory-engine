@@ -1,5 +1,3 @@
----
-
 # 🏴‍☠️ Artifactory Security Engine
 
 Artifactory is an autonomous, token-efficient AI security-testing engine that runs **inside [OpenCode](https://github.com/sst/opencode)** (a terminal AI coding agent). You talk to it in plain English with `/artifactory` slash commands; it does the tradecraft — scoped, safe, and repeatable.
