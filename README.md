@@ -47,7 +47,7 @@ chmod +x install.sh
 `install.sh` does four things:
 
 1. **Promotes this checkout into a stable release dir** at `~/artifactory-engine/` (copies the engine, refreshes it if it already exists, leaves your live `.blackboard/` intact). You edit code here in the checkout, then re-run `./install.sh` to push changes to the stable dir.
-2. **Registers the `/artifactory` commands and the specialist subagents** into `~/.config/opencode/` (15 command files + 5 agent files), rewriting every path to the absolute stable location.
+2. **Registers the `/artifactory` command and the specialist subagents** into `~/.config/opencode/` (1 dispatcher command file + 5 agent files), rewriting every path to the absolute stable location. `/artifactory <workflow>` routes to one of 15 workflow bodies (`artifactory/workflows/*.md`), loaded lazily so each invocation costs one short workflow, not a monolith.
 3. **Makes all engine tools executable** and checks for optional external tools (`python3`, `git`, `semgrep`, `nmap`, `httpx`, `ffuf`) — it *reports* what's missing but does not install anything.
 4. Everything the commands run points at one entry point: `~/artifactory-engine/artifactory/art.py <tool>`.
 
@@ -156,6 +156,7 @@ artifactory/
 ├── knowledge/        ← playbook_engine, lineage, cross_index, skeptic_ledger, sources.json (curated library)
 ├── ops/              ← doctor, maintenance, snapshot, tripwires, payload_corpus, …
 ├── eval/             ← eval_engine (test suite), vuln labs, greenhouse, self_improve
+├── workflows/        ← the 15 `/artifactory <workflow>` bodies, lazily loaded by `art.py workflow`
 └── prompts/          ← the reusable tradecraft playbook library
 ```
 

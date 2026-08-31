@@ -55,10 +55,11 @@ WIRING_EXEMPT = {
 
 def wiring_check(install_sh: str = None):
     """True orphans = engine tool modules that are (a) NOT reachable from any
-    emitted command/agent doc AND (b) NOT covered by a suite check AND (c) NOT
-    on the curated library exemption list. Module discovery is registry-driven
-    (recurses into feature packages; kernel infra art/bootstrap/registry and
-    data dirs are excluded by the registry itself). Returns (ok, orphans)."""
+    emitted command/agent doc OR workflow body AND (b) NOT covered by a suite
+    check AND (c) NOT on the curated library exemption list. Module discovery is
+    registry-driven (recurses into feature packages; kernel infra
+    art/bootstrap/registry and data dirs are excluded by the registry itself).
+    Returns (ok, orphans)."""
     from registry import registry as _tool_registry
 
     root = _ROOT
@@ -66,6 +67,14 @@ def wiring_check(install_sh: str = None):
         install_sh = str(root.parent / "install.sh")
 
     inst = Path(install_sh).read_text()
+    # The /artifactory dispatcher lazily loads one workflow body per invocation;
+    # those bodies (workflows/*.md) are the emitted command corpus, so a tool
+    # referenced only from a workflow is still wired, not orphaned.
+    wf_docs = ""
+    wf_dir = root / "workflows"
+    if wf_dir.is_dir():
+        wf_docs = "\n".join(p.read_text() for p in wf_dir.glob("*.md"))
+    inst = inst + "\n" + wf_docs
     eval_src = (Path(_tool_registry()["eval_engine"]["path"])).read_text()
 
     orphans = []

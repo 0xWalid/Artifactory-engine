@@ -730,8 +730,8 @@ def suite_engine(verbose=False):
         check("greenhouse acceptance ACCEPTS a matching playbook",
               rc == 0 and "ACCEPTED" in out, out)
 
-        # 27) A1/A2: command-split smoke install — per-workflow files under the
-        # byte budget, full workflow coverage (majors + catalog), dynamic count
+        # 27) A1/A2: dispatcher smoke install — ONE /artifactory command that
+        # routes on $ARGUMENTS to lazily-loaded workflow bodies (no monolith)
         import subprocess as _sp2
         import tempfile as _tf
         import os as _os2
@@ -741,24 +741,29 @@ def suite_engine(verbose=False):
                      cwd=str(_ENGINE_ROOT.parent), env=env,
                      capture_output=True, text=True, timeout=300).returncode
         cmd_dir = Path(fakehome) / ".config" / "opencode" / "commands"
+        disp = cmd_dir / "artifactory.md"
+        disp_text = disp.read_text() if disp.exists() else ""
+        check("A1: smoke install emits the single /artifactory dispatcher",
+              rc == 0 and disp.exists(), f"rc={rc} exists={disp.exists()}")
+        # the dispatcher routes on $ARGUMENTS through the workflow loader
+        check("A1: dispatcher routes via $ARGUMENTS + `art.py workflow`",
+              "$ARGUMENTS" in disp_text and "art.py workflow" in disp_text,
+              "routing markers missing from dispatcher")
+        # byte budget: the dispatcher stays small (vs the ~30KB monolith)
+        dsz = disp.stat().st_size if disp.exists() else 0
+        check("A1: dispatcher within the 4KB lazy-load budget",
+              0 < dsz <= 4096, f"size={dsz}B")
+        # coverage: all 15 workflow bodies ship in the stable engine; the loader
+        # resolves each; the catalog body indexes the non-major tools
+        stable_wf = Path(fakehome) / "artifactory-engine" / "artifactory" / "workflows"
         expected_files = ["analyze", "test", "intel", "scan-code", "research",
                           "discover", "roles", "oob", "chains", "eval-lab",
                           "nuclei", "burp", "patchdiff", "tokens", "catalog"]
-        have = {p.stem for p in cmd_dir.glob("*.md")} if cmd_dir.exists() else set()
+        have = {p.stem for p in stable_wf.glob("*.md")} if stable_wf.exists() else set()
         missing = [f for f in expected_files if f not in have]
-        check("A1: smoke install emits all 15 per-workflow command files",
+        check("A1: all 15 workflow bodies ship in the stable engine",
               rc == 0 and not missing, f"rc={rc} missing={missing}")
-        # byte budget: every emitted file <= 4KB (vs the ~30KB monolith)
-        over = []
-        for p in (cmd_dir.glob("*.md") if cmd_dir.exists() else []):
-            if p.stat().st_size > 4096:
-                over.append(f"{p.stem}:{p.stat().st_size}B")
-        check("A1: every command file within the 4KB lazy-load budget",
-              not over, f"over-budget: {over}")
-        # coverage: the catalog one-line-indexes the non-major workflows; the
-        # split must not drop ANY documented workflow (spot-check a sample of
-        # tool names that lived in the old monolith's non-major sections)
-        cat_text = (cmd_dir / "catalog.md").read_text() if (cmd_dir / "catalog.md").exists() else ""
+        cat_text = (stable_wf / "catalog.md").read_text() if (stable_wf / "catalog.md").exists() else ""
         sample_tools = ["greenhouse", "lineage", "cross_index", "tripwires",
                         "skeptic_ledger", "secrets", "entropy", "graphql",
                         "race", "snapshot", "doctor", "client_report",
@@ -766,11 +771,9 @@ def suite_engine(verbose=False):
         dropped = [t for t in sample_tools if t not in cat_text]
         check("A1: catalog loses no documented workflow (16-tool sample)",
               not dropped, f"dropped from catalog: {dropped}")
-        # shared rules present in every file (generator-level dedup worked)
-        no_preamble = [p.stem for p in cmd_dir.glob("*.md")
-                       if "safe runner" not in p.read_text()] if cmd_dir.exists() else ["ALL"]
-        check("A1: shared preamble emitted into every file",
-              not no_preamble, f"missing preamble: {no_preamble}")
+        # shared operational rules present in the dispatcher (single-file dedup)
+        check("A1: shared preamble emitted into the dispatcher",
+              "safe runner" in disp_text, "preamble missing from dispatcher")
         # A2: install.sh contains exactly ONE sed rewrite pass
         inst_src = (_ENGINE_ROOT.parent / "install.sh").read_text()
         sed_count = inst_src.count('sed -i "s|~/artifactory|$ENGINE|g"')
