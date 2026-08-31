@@ -1,0 +1,57 @@
+{
+  "ssrf": {
+    "file": "ssrf.txt",
+    "when": "any user-influenced URL/fetch parameter; blind versions point at oob.py probes",
+    "tags": [
+      "cloud",
+      "internal",
+      "metadata"
+    ],
+    "provenance": "artifactory seed corpus (evolves via debrief)",
+    "added": "2026-08-29"
+  },
+  "traversal": {
+    "file": "traversal.txt",
+    "when": "file/path parameters, downloads, imports; watch for normalization differentials",
+    "tags": [
+      "lfi",
+      "read",
+      "windows",
+      "linux"
+    ],
+    "provenance": "artifactory seed corpus (evolves via debrief)",
+    "added": "2026-08-29"
+  },
+  "redirect": {
+    "file": "redirect.txt",
+    "when": "redirect/to/return/continue/url params; check open-redirect + header-splitting",
+    "tags": [
+      "phishing",
+      "oauth"
+    ],
+    "provenance": "artifactory seed corpus (evolves via debrief)",
+    "added": "2026-08-29"
+  },
+  "authbypass": {
+    "file": "authbypass.txt",
+    "when": "admin/gated routes: header/role/param-based bypass attempts (any-edition Burp friendly)",
+    "tags": [
+      "bac",
+      "role",
+      "header"
+    ],
+    "provenance": "artifactory seed corpus (evolves via debrief)",
+    "added": "2026-08-29"
+  },
+  "sqli": {
+    "file": "sqli.txt",
+    "when": "any db-backed parameter; start error-based, escalate blind/time-based",
+    "tags": [
+      "auth",
+      "union",
+      "blind"
+    ],
+    "provenance": "artifactory seed corpus (evolves via debrief)",
+    "added": "2026-08-29"
+  }
+}

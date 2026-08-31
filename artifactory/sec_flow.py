@@ -14,6 +14,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,8 @@ _engine_dir = str(Path(__file__).resolve().parent)
 if _engine_dir not in sys.path:
     sys.path.insert(0, _engine_dir)
 from board_io import json_transaction  # noqa: E402
+from scope_sig import verify_scope, tamper_notice, sign_scope  # noqa: E402
+from redact import redact  # noqa: E402
 
 BLACKBOARD_DIR = Path.cwd() / ".blackboard"
 ARTIFACTS_DIR = BLACKBOARD_DIR / "artifacts"
@@ -31,6 +34,7 @@ SCOPE_FILE = BLACKBOARD_DIR / "scope.json"
 BOARD_FILE = BLACKBOARD_DIR / "board.json"
 CANARY_FILE = BLACKBOARD_DIR / "canaries.json"
 RATIONALE_FILE = BLACKBOARD_DIR / "rationale.jsonl"
+FINGERPRINTS_FILE = BLACKBOARD_DIR / "fingerprints.json"
 
 # Finding severity/status vocabularies (WS1: verification gate).
 SEVERITIES = ["info", "low", "medium", "high", "critical"]
@@ -94,6 +98,100 @@ def is_target_in_scope(target: str, scope: dict) -> bool:
     return False
 
 
+# ---------------------------------------------------------------- rate limiter
+# Per-host pacing enforced IN CODE (not policy text): the plan's "rate limits
+# enforced by the harness" gap. Defaults live in scope.json `rate_limit` and
+# apply to every `run` command targeting a host (not passive-intel allowlist
+# lookups, which never touch targets).
+DEFAULT_RATE_LIMIT = {"min_interval_seconds": 0.0}
+RATE_STATE_FILE = BLACKBOARD_DIR / "rate_state.json"
+
+
+def _rate_limit_for(scope: dict) -> dict:
+    rl = scope.get("rate_limit") or {}
+    return {**DEFAULT_RATE_LIMIT, **rl}
+
+
+def enforce_rate_limit(target: str, scope: dict):
+    """Pace consecutive commands against the same host. Blocking sleep is
+    bounded (< a few seconds) because min_interval is an operator-set ceiling,
+    not an attacker-controlled value. Fails open if state is unreadable — the
+    scope/canary/destructive gates carry the security load, pacing is safety
+    polish (and is skipped entirely with min_interval_seconds <= 0)."""
+    rl = _rate_limit_for(scope)
+    interval = float(rl.get("min_interval_seconds") or 0)
+    if interval <= 0:
+        return
+    host = clean_host(target)
+    try:
+        state = load_json(RATE_STATE_FILE)
+        last = state.get(host)
+        if last:
+            elapsed = datetime.now(timezone.utc).timestamp() - float(last)
+            if elapsed < interval:
+                wait = interval - elapsed
+                print(f"[~] RATE LIMIT: pacing {host} ({wait:.1f}s until next command "
+                      f"is allowed; scope rate_limit.min_interval_seconds={interval:.1f}s)")
+                time.sleep(min(wait, 30))
+        # Always stamp the host's last-use time (first use included) so the
+        # NEXT command against this host paces correctly. Lock-serialised so
+        # parallel agents don't race on the pacing file.
+        state[host] = datetime.now(timezone.utc).timestamp()
+        try:
+            with json_transaction("rate_state.json", create=True) as rs:
+                if rs is not None:
+                    rs.clear()
+                    rs.update(state)
+        except Exception:
+            pass
+    except Exception:
+        pass  # pacing is advisory; never block the engagement on its own state
+
+
+# ------------------------------------------------------ target fingerprint cache
+# "Cache by target fingerprint — never re-learn a framework version twice."
+# Records tech banners per host with a TTL; recon commands can consult the
+# cache before re-probing, and intel.py can key CVE enumeration off it.
+FINGERPRINT_TTL_DAYS = 14
+
+
+def record_fingerprint(host: str, tech: str, source: str = "banner"):
+    """Store a tech/version observation for a host (deduped, timestamped)."""
+    host = clean_host(host)
+    try:
+        with json_transaction("fingerprints.json", create=True) as fp:
+            if fp is None:
+                return
+            entries = fp.setdefault(host, [])
+            if not any(e.get("tech") == tech for e in entries):
+                entries.append({
+                    "tech": tech,
+                    "source": source,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                })
+    except Exception:
+        pass
+
+
+def lookup_fingerprints(host: str, fresh_only: bool = True) -> list:
+    """Return tech observations for a host (optionally TTL-filtered)."""
+    host = clean_host(host)
+    fp = load_json(FINGERPRINTS_FILE)
+    entries = fp.get(host, []) if fp else []
+    if not fresh_only:
+        return entries
+    cutoff = datetime.now(timezone.utc).timestamp() - FINGERPRINT_TTL_DAYS * 86400
+    fresh = []
+    for e in entries:
+        try:
+            ts = datetime.fromisoformat(e.get("recorded_at", "")).timestamp()
+        except Exception:
+            continue
+        if ts >= cutoff:
+            fresh.append(e)
+    return fresh
+
+
 def clean_host(target: str) -> str:
     return target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
 
@@ -137,7 +235,24 @@ def classify_and_expand_scope(host: str) -> str:
             if host not in pending:
                 pending.append(host)
             outcome = "pending"
+    # Outside the transaction: re-sign so the (authorized-field) change keeps
+    # verifying. pending_scope is unsigned by design, so this stays valid.
+    try:
+        sign_scope()
+    except Exception:
+        pass
     return outcome
+
+
+# Filesystem roots too broad to ever authorize for SAST/SCA source scanning.
+# An operator can still edit scope.json directly (then re-sign) if they truly
+# mean it — the CLI just refuses to be the footgun.
+FORBIDDEN_CODE_ROOTS = {"/", "/tmp", "/var", "/etc", "/usr", "/opt", "/home", "/root", "/srv"}
+
+
+def _is_forbidden_code_path(resolved: str) -> bool:
+    p = Path(resolved)
+    return str(p) in FORBIDDEN_CODE_ROOTS or p.parent == p  # "/" resolves to itself
 
 
 def manage_scope(add_host=None, add_domain=None, add_cidr=None, add_code_path=None,
@@ -173,13 +288,19 @@ def manage_scope(add_host=None, add_domain=None, add_cidr=None, add_code_path=No
         if add_cidr and add_cidr not in allowed_cidrs:
             allowed_cidrs.append(add_cidr)
             print(f"[✔] Added CIDR to scope: {add_cidr}")
-        if add_code_path:
-            resolved = str(Path(add_code_path).resolve())
-            if resolved not in allowed_code_paths:
-                allowed_code_paths.append(resolved)
-                print(f"[✔] Authorized code path for SAST/SCA: {resolved}")
-            else:
-                print(f"[*] Code path already authorized: {resolved}")
+    if add_code_path:
+        resolved = str(Path(add_code_path).resolve())
+        if _is_forbidden_code_path(resolved):
+            print(f"[!] SCOPE ERROR: '{resolved}' is a system-level root — too broad to "
+                  f"authorize for code scanning. Authorize the specific project directory "
+                  f"instead (edit scope.json directly + re-run init_env.py to re-sign "
+                  f"if you genuinely need this).", file=sys.stderr)
+            sys.exit(1)
+        if resolved not in allowed_code_paths:
+            allowed_code_paths.append(resolved)
+            print(f"[✔] Authorized code path for SAST/SCA: {resolved}")
+        else:
+            print(f"[*] Code path already authorized: {resolved}")
         if approve:
             host = clean_host(approve)
             if host in pending:
@@ -187,6 +308,12 @@ def manage_scope(add_host=None, add_domain=None, add_cidr=None, add_code_path=No
             if host not in allowed_hosts:
                 allowed_hosts.append(host)
             print(f"[✔] Approved into scope: {host}")
+
+    # Any operator-driven scope edit re-signs the authorization fields.
+    try:
+        sign_scope()
+    except Exception:
+        pass
 
 
 def update_board_state(pointer_id: str, cmd: str, returncode: int, summary: str = ""):
@@ -256,9 +383,76 @@ def _resolve_evidence(poc: str, evidence_from):
     return evidence_text, evidence_pointer, has_evidence
 
 
+# Variant propagation: confirmed bug-class -> keyword family. When IDOR is
+# proven on one endpoint, every other object-bearing endpoint becomes a
+# same-family candidate until tested. Table mirrors researcher instinct.
+FINDING_CLASS_FAMILIES = [
+    ("idor", ["idor", "object reference", "bola", "ownership"]),
+    ("access-control", ["access control", "bac", "privilege", "auth bypass", "role",
+                        "unauthorized access", "admin"]),
+    ("traversal", ["traversal", "path", "lfi", "file read"]),
+    ("ssrf", ["ssrf", "server-side request"]),
+    ("injection", ["sqli", "sql injection", "command injection", "ssti", "xss", "injection"]),
+    ("leak", ["leak", "disclosure", "exposed", "verbose", "debug"]),
+    ("redirect", ["redirect", "open redirect"]),
+    ("mass-assignment", ["mass assignment", "role field", "parameter tampering"]),
+]
+
+
+def _finding_class(text: str) -> str:
+    t = (text or "").lower()
+    for cls, kws in FINDING_CLASS_FAMILIES:
+        if any(k in t for k in kws):
+            return cls
+    return ""
+
+
+def _propagate_variants(entry: dict, board: dict) -> list:
+    """On confirm, queue same-class sweeps across the untested inventory.
+    Deterministic: keywords + endpoints already on the board. Never overwrites
+    existing leads (dedup by value prefix)."""
+    cls = _finding_class(entry.get("title", "") + " " + (entry.get("details") or ""))
+    if not cls:
+        return []
+    assets = (board.get("discovered_assets") or {}).get("endpoints", [])
+    if not assets:
+        return []
+
+    existing = {str(l.get("value", "")) for l in board.get("leads", [])}
+    out = []
+    for ep in assets:
+        ep = str(ep)
+        if not ep.startswith("/"):
+            continue
+        # skip the endpoint(s) this finding already covers
+        if ep in entry.get("title", "") + (entry.get("details") or ""):
+            continue
+        value = f"variant sweep [{cls}]: {ep}"
+        if value in existing:
+            continue
+        out.append({
+            "id": f"LEAD_{uuid.uuid4().hex[:6].upper()}",
+            "type": "endpoint",
+            "value": value,
+            "signal": f"same bug family as confirmed '{entry.get('title', '')[:60]}' — "
+                      f"test this endpoint for the same class",
+            "confidence": 0.55,
+            "suggested_next": f"run the same {cls} technique against {ep}; "
+                               f"kill with --set-status dead if it doesn't reproduce",
+            "must_verify": True,
+            "preconditions": [],
+            "source_pointer": entry.get("evidence_pointer") or "VARIANT_SWEEP",
+            "status": "new",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    return out[:40]  # cap: sweeps stay useful, not spammy
+
+
+
 def add_asset_to_board(host: str = None, endpoint: str = None, port: str = None,
                        finding: str = None, details: str = "", severity: str = "info",
-                       status: str = "informational", poc: str = "", evidence_from=None):
+                       status: str = "informational", poc: str = "", evidence_from=None,
+                       chain_to=None):
     if not BOARD_FILE.exists():
         print(f"[!] Error: {BOARD_FILE} not found. Run init_env.py first.", file=sys.stderr)
         sys.exit(1)
@@ -325,8 +519,31 @@ def add_asset_to_board(host: str = None, endpoint: str = None, port: str = None,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "related_pointers": recent_pointers,
                 }
+                # Chain edges: link this finding to prior finding IDs (the
+                # chain-mining graph — a leaked token -> auth bypass -> IDOR
+                # becomes an explicit, walkable attack path on the board).
+                if chain_to:
+                    for cid in chain_to.split(","):
+                        cid = cid.strip()
+                        if cid and cid != entry["id"] and any(
+                                f.get("id") == cid for f in findings_list):
+                            entry.setdefault("chain_to", []).append(cid)
                 findings_list.append(entry)
                 added.append(f"Finding[{status}/{severity}]: {finding}")
+
+                # Variant propagation (researcher habit): a CONFIRMED bug of a
+                # class rarely exists at exactly one sink. When a finding is
+                # confirmed, deterministically queue same-class leads over the
+                # rest of the endpoint inventory so the sweep happens instead of
+                # being "noted". Only on confirm — informational stays quiet.
+                if status == "confirmed":
+                    try:
+                        variant_leads = _propagate_variants(entry, board_data)
+                        if variant_leads:
+                            board_data.setdefault("leads", []).extend(variant_leads)
+                            added.append(f"{len(variant_leads)} variant-sweep lead(s) queued")
+                    except Exception:
+                        pass  # propagation is opportunistic, never blocks a finding
 
         print(f"[✔] Blackboard updated: {', '.join(added) if added else 'No new entries'}")
 
@@ -371,6 +588,263 @@ def add_rationale(lead=None, hypothesis="", why="", action="", expected="",
     with open(RATIONALE_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
     print(f"[✔] Rationale logged{f' for {lead}' if lead else ''}.")
+
+
+def manage_chains(link=None, unlink=None, note=""):
+    """WS-CHAIN: view and edit the finding chain graph on the board.
+
+    Chains are how discrete findings compose into demonstrated end-to-end
+    impact (leaked token -> auth bypass -> IDOR -> data reach). The graph is
+    walked here deterministically; chain COMPOSITION (which findings join)
+    is the frontier model's job — this view makes the result inspectable.
+
+    link: "FINDING_A,FINDING_B" (directed edge A -> B)
+    unlink: "FINDING_A,FINDING_B" (remove that edge)
+    note: optional annotation stored on the edge (A -> B)
+    """
+    ensure_blackboard_dirs()
+    changed = False
+    with json_transaction("board.json") as board:
+        if board is None:
+            print(f"[!] Error: {BOARD_FILE} not found. Run init_env.py first.", file=sys.stderr)
+            sys.exit(1)
+        findings = {f.get("id"): f for f in board.get("findings", [])}
+
+        def _pair(arg):
+            if not arg or "," not in arg:
+                print("[!] Use --link/--unlink FINDING_A,FINDING_B (comma-separated pair).",
+                      file=sys.stderr)
+                sys.exit(1)
+            a, b = [x.strip() for x in arg.split(",", 1)]
+            return a, b
+
+        if link:
+            a, b = _pair(link)
+            if a not in findings or b not in findings:
+                print(f"[!] Both findings must exist on the board. Known: "
+                      f"{', '.join(findings) or 'none'}", file=sys.stderr)
+                sys.exit(1)
+            edges = findings[a].setdefault("chain_to", [])
+            if b not in edges:
+                edges.append(b)
+                changed = True
+            if note:
+                findings[a].setdefault("chain_notes", {})[b] = note
+                changed = True
+        if unlink:
+            a, b = _pair(unlink)
+            f = findings.get(a)
+            if f and b in f.get("chain_to", []):
+                f["chain_to"].remove(b)
+                f.get("chain_notes", {}).pop(b, None)
+                changed = True
+
+    if changed:
+        print("[✔] Chain graph updated.")
+
+    # --- view: every edge in the graph + longest paths (attack paths) ---
+    board = load_json(BOARD_FILE)
+    findings = board.get("findings", [])
+    by_id = {f.get("id"): f for f in findings}
+    edges = []
+    for f in findings:
+        for b in f.get("chain_to", []):
+            note_txt = f.get("chain_notes", {}).get(b, "")
+            edges.append((f.get("id"), b, note_txt))
+
+    if not edges:
+        print("[*] No chain edges yet. Link findings with: chains --link FINDING_A,FINDING_B --note 'why'")
+        print("    (e.g. token-leak finding -> auth-bypass finding -> IDOR finding)")
+        return
+
+    # simple reachability for path rendering
+    graph = {}
+    for a, b, _ in edges:
+        graph.setdefault(a, []).append(b)
+
+    def walk(start, path=None):
+        path = path or [start]
+        best = [path]
+        for nxt in graph.get(start, []):
+            if nxt in path:
+                continue
+            best.append(walk(nxt, path + [nxt]))
+        return max(best, key=len)
+
+    print(f"[*] Chain graph ({len(edges)} edge(s), {len(findings)} findings):\n")
+    for a, b, note_txt in edges:
+        t1 = (by_id.get(a, {}).get("title") or "?")[:60]
+        t2 = (by_id.get(b, {}).get("title") or "?")[:60]
+        print(f"  {a} -> {b}")
+        print(f"      '{t1}'  =>  '{t2}'")
+        if note_txt:
+            print(f"      note: {note_txt}")
+
+    # highlight the longest attack path
+    longest = []
+    for fid in by_id:
+        p = walk(fid)
+        if len(p) > len(longest):
+            longest = p
+    if len(longest) > 1:
+        print(f"\n  ★ LONGEST DEMONSTRATED ATTACK PATH ({len(longest)} steps):")
+        for i, fid in enumerate(longest, 1):
+            t = (by_id.get(fid, {}).get("title") or "?")[:70]
+            print(f"     {i}. {fid} — {t}")
+
+
+# ---------------------------------------------------------- chain mining
+# Deterministic primitive/needs matching: when does finding A's capability
+# satisfy finding B's requirement? Keywords are cheap and explicit; the table
+# mirrors prompts/chaining/chain_methodology.md. This PROPOSES edges — the
+# operator/agent accepts with `chains --link`.
+PRIMITIVE_NEEDS = [
+    # (primitive keywords in A's title/details, needs keywords in B, why)
+    (["leak", "secret", "key", "token", "credential", "password"],
+     ["auth", "bypass", "session", "csrf", "api", "admin", "login", "jwt"],
+     "A's leaked credential material can satisfy B's authentication requirement"),
+    (["ssrf", "fetch", "internal", "network", "request"],
+     ["internal", "metadata", "admin", "localhost", "cloud", "169.254"],
+     "A's network reach can access B's internal-only surface"),
+    (["xss", "script", "dom"],
+     ["cookie", "csrf", "victim", "session", "same-site", "samesite", "action"],
+     "A's script execution in the victim origin can drive B's authenticated action"),
+    (["idor", "object", "read", "data", "access control", "bac"],
+     ["admin", "panel", "function", "action", "sensitive", "order", "user", "account",
+      "write", "update", "delete", "modify", "mass"],
+     "A's broken object/access control likely extends to B's surface (same flaw family)"),
+    (["file read", "traversal", "lfi", "disclosure", "path"],
+     ["config", "env", "secret", "key", "credential", "source"],
+     "A's file-read primitive can disclose B's sensitive configuration"),
+    (["privilege", "role", "admin", "mass assignment", "escalation", "access control"],
+     ["admin", "function", "panel", "action", "sensitive", "order"],
+     "A's elevated/unchecked role unlocks B's privileged functionality"),
+    # B1: the data_exfil goal's needs entry (goal-reachable per plan done-when)
+    (["data reach", "data exposure", "exfiltration", "dump", "idor", "object"],
+     ["data_reach", "object_access", "network"],
+     "A's object/data access satisfies B's data-reach requirement"),
+]
+
+
+def plan_chains(goal: str, top: int = 3, auto_link: bool = False):
+    """B1: multi-hop capability-graph planning toward a named goal (RCE /
+    data_exfil / auth_bypass / priv_esc). Uses confirmed findings AND
+    unconfirmed primitives; returns most-probable paths (Dijkstra, -log conf).
+    Writes ONLY hypo_edges (board-level); never chain_to without evidence.
+    --auto-link additionally links evidence-backed ADJACENT hops of a
+    confirmed-only path into chain_to (the guarded store stays proof-only)."""
+    import chain_planner
+    board = load_json(BOARD_FILE)
+    if not board:
+        print(f"[!] Error: {BOARD_FILE} not found. Run init_env.py first.", file=sys.stderr)
+        sys.exit(1)
+    if goal not in chain_planner.GOALS:
+        print(f"[!] Unknown goal '{goal}'. Known: {', '.join(chain_planner.GOALS)}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    paths = chain_planner.plan_paths(board, goal, top=top)
+    if not paths:
+        print(f"[*] no chain to goal (clean exit)")
+        return
+
+    edges = chain_planner.propose_hypo_edges(board, paths)
+
+    # persist hypo_edges (NEVER chain_to from planner inventions)
+    with json_transaction("board.json") as b:
+        if b is not None:
+            he = b.setdefault("hypo_edges", [])
+            existing = {(e.get("from"), e.get("to")) for e in he}
+            for e in edges:
+                if (e["from"], e["to"]) not in existing:
+                    he.append(e)
+                    existing.add((e["from"], e["to"]))
+            # --auto-link: evidence-backed adjacent confirmed-finding hops only
+            linked = 0
+            if auto_link:
+                confirmed_ids = {f.get("id") for f in b.get("findings", [])
+                                 if f.get("status") == "confirmed"}
+                for path, _c, _cf, _h in paths:
+                    for a, nxt in zip(path, path[1:]):
+                        if a in confirmed_ids and nxt in confirmed_ids:
+                            fa = next((f for f in b.get("findings", [])
+                                       if f.get("id") == a), None)
+                            if fa and nxt not in (fa.get("chain_to") or []):
+                                fa.setdefault("chain_to", []).append(nxt)
+                                linked += 1
+    print(f"[*] CHAIN PLAN -> {goal}: {len(paths)} ranked path(s), "
+          f"{len(edges)} hypo_edge(s) written to board.hypo_edges")
+    for i, (path, cost, conf, hops) in enumerate(paths, 1):
+        labels = " -> ".join(chain_planner.label_for(nid, board) for nid in path)
+        print(f"  #{i} (conf {conf:.2f}, {hops} hop(s), cost {cost:.2f}): {labels}")
+    if auto_link:
+        print(f"    --auto-link: {linked} evidence-backed hop(s) linked into chain_to; "
+              f"unproven hops remain in hypo_edges only.")
+    print("    Unproven hops are HYPOTHETICAL — confirm with evidence to promote.")
+
+
+def mine_chains(auto_link=False):
+    """Propose chain edges from finding primitives/needs. Deterministic: each
+    finding's title+details are matched against the primitive/needs table;
+    proposals are printed (and optionally linked with --auto-link, still
+    gated by being explicit operator action)."""
+    board = load_json(BOARD_FILE)
+    if not board:
+        print(f"[!] Error: {BOARD_FILE} not found. Run init_env.py first.", file=sys.stderr)
+        sys.exit(1)
+    findings = board.get("findings", [])
+    if len(findings) < 2:
+        print("[*] Need >= 2 findings before chain mining has anything to mine.")
+        return
+
+    proposals = []
+    already = []
+    for a in findings:
+        text_a = (a.get("title", "") + " " + a.get("details", "")).lower()
+        for b in findings:
+            if a is b or a.get("id") == b.get("id"):
+                continue
+            text_b = (b.get("title", "") + " " + b.get("details", "")).lower()
+            for prim_kws, need_kws, why in PRIMITIVE_NEEDS:
+                if any(k in text_a for k in prim_kws) and any(k in text_b for k in need_kws):
+                    if b.get("id") in (a.get("chain_to") or []):
+                        already.append((a["id"], b["id"], why))
+                    else:
+                        proposals.append((a["id"], b["id"], why))
+                    break
+
+    if not proposals and not already:
+        print("[*] No chain proposals — findings don't compose by the primitive/needs table.")
+        return
+
+    print(f"[*] CHAIN MINING: {len(proposals)} new proposal(s), "
+          f"{len(already)} already linked (deterministic primitive/needs match):\n")
+    by_id = {f.get("id"): f for f in findings}
+    linked = 0
+    for a_id, b_id, why in proposals:
+        ta = (by_id.get(a_id, {}).get("title") or "?")[:50]
+        tb = (by_id.get(b_id, {}).get("title") or "?")[:50]
+        print(f"  {a_id} -> {b_id}")
+        print(f"      '{ta}'")
+        print(f"        => '{tb}'")
+        print(f"      why: {why}\n")
+        if auto_link:
+            # reuse the guarded link path
+            with json_transaction("board.json") as bd:
+                if bd is not None:
+                    fa = next((f for f in bd.get("findings", []) if f.get("id") == a_id), None)
+                    if fa and b_id not in (fa.get("chain_to") or []):
+                        fa.setdefault("chain_to", []).append(b_id)
+                        linked += 1
+    if already:
+        print("  Already linked (miner confirms existing edges):")
+        for a_id, b_id, why in already:
+            print(f"    {a_id} -> {b_id}  ({why[:60]})")
+    if auto_link and proposals:
+        print(f"[✔] Linked {linked} proposal(s). Review with: chains")
+    elif proposals:
+        print("\n    Accept with: chains --link <A>,<B> --note '<why>'  "
+              "(or --auto-link to accept all proposals at once)")
 
 
 def load_canary_token() -> str:
@@ -429,6 +903,14 @@ def is_destructive_command(cmd: str) -> tuple[bool, str]:
 def preflight_checks(cmd: str, target: str) -> str:
     """Runs every hard gate before a command may execute. Exits the process on
     any violation. Returns the resolved canary token (for the post-exec scan)."""
+    # Scope-signature gate (tamper evidence): a TAMPERED scope authorizes
+    # nothing, ever. Unsigned legacy workspaces proceed (operator migration
+    # path) — the suite covers both branches.
+    verdict = verify_scope()
+    if verdict.startswith("TAMPERED"):
+        print(tamper_notice(), file=sys.stderr)
+        sys.exit(1)
+
     scope = load_json(SCOPE_FILE)
 
     # Fail-closed scope gate: refuse to execute unless a populated scope exists
@@ -530,14 +1012,14 @@ def execute_and_log(cmd: str, pointer_id: str, canary: str, quiet: bool = False)
     if not quiet:
         if len(lines) > 100:
             print(f"[+] Output truncated (>100 lines). Full log: .blackboard/artifacts/{pointer_id}.log")
-            print("\n".join(lines[:20]))
+            print("\n".join(redact(l) for l in lines[:20]))
             print(f"\n... [{len(lines) - 40} lines omitted] ...\n")
-            print("\n".join(lines[-20:]))
+            print("\n".join(redact(l) for l in lines[-20:]))
         else:
             if stdout:
-                print(stdout)
+                print(redact(stdout))
         if stderr:
-            print(stderr, file=sys.stderr)
+            print(redact(stderr), file=sys.stderr)
 
 
 def launch_background(cmd: str, target: str, pointer_id: str):
@@ -604,6 +1086,9 @@ def shell_feature_notice(cmd: str) -> str:
 def run_command(cmd: str, target: str = None, background: bool = False):
     ensure_blackboard_dirs()
     canary = preflight_checks(cmd, target)
+
+    # Per-host pacing (scope.json rate_limit) — enforced before every exec.
+    enforce_rate_limit(target, load_json(SCOPE_FILE))
 
     notice = repeat_command_notice(cmd)
     if notice:
@@ -693,6 +1178,10 @@ def inspect_artifact(pointer_id: str, grep_pattern: str = None, json_key: str = 
 
     raw_text = artifact_path.read_text()
 
+    # Egress redaction: what leaves the engine is scrubbed; the artifact
+    # itself stays byte-identical so evidence remains verifiable.
+    raw_text = redact(raw_text)
+
     # Extract STDOUT section only
     stdout_match = re.search(r"--- STDOUT ---\n(.*?)(?=\n--- STDERR ---|\Z)", raw_text, re.DOTALL)
     stdout_content = stdout_match.group(1).strip() if stdout_match else raw_text
@@ -733,9 +1222,188 @@ def inspect_artifact(pointer_id: str, grep_pattern: str = None, json_key: str = 
         print(f"\n... [{len(lines) - max_lines} lines omitted] ...")
 
 
+def workspace_status():
+    """One-glance engagement dashboard: scope health, findings, leads, chains,
+    sessions, tokens, fingerprints. Pulls together what would otherwise be
+    eight separate commands — the operator's first stop each session."""
+    board = load_json(BOARD_FILE)
+    if not board:
+        print("[!] No board.json — run init_env.py first.", file=sys.stderr)
+        sys.exit(1)
+
+    verdict = verify_scope()
+    sig = {"ok": "[✔] signed (tamper-evident)",
+           "unsigned": "[~] unsigned (legacy — re-run init_env.py to enable)"}.get(
+        verdict, f"[!] {verdict}")
+
+    findings = board.get("findings", [])
+    confirmed = [f for f in findings if f.get("status") == "confirmed"]
+    leads = board.get("leads", [])
+    by_status = {}
+    for l in leads:
+        by_status[l.get("status", "?")] = by_status.get(l.get("status", "?"), 0) + 1
+    chains = sum(len(f.get("chain_to", [])) for f in findings)
+    sessions = board.get("sessions", [])
+    valid_sessions = [s for s in sessions if s.get("valid", True)]
+
+    print("=" * 60)
+    print("ENGAGEMENT STATUS")
+    print("=" * 60)
+    print(f"  Scope:      {sig}")
+    sc = load_json(SCOPE_FILE)
+    if sc:
+        print(f"              hosts={len(sc.get('allowed_hosts', []))} "
+              f"domains={len(sc.get('allowed_domains', []))} "
+              f"cidrs={len(sc.get('allowed_cidrs', []))} "
+              f"pending={len(sc.get('pending_scope', []))} "
+              f"rate_limit={bool((sc.get('rate_limit') or {}).get('min_interval_seconds'))}")
+    print(f"  Findings:   {len(confirmed)} confirmed / "
+          f"{len(findings) - len(confirmed)} informational")
+    print(f"  Leads:      {len(leads)} total "
+          f"({', '.join(f'{k}={v}' for k, v in sorted(by_status.items())) or 'none'})")
+    print(f"  Chains:     {chains} edge(s) — view: sec_flow.py chains")
+    print(f"  Sessions:   {len(valid_sessions)} valid role(s) of {len(sessions)} "
+          f"— list: auth_manager.py list")
+    try:
+        from tokens import _load_ledger_totals  # cheap reuse, no side effects
+        total = _load_ledger_totals()
+        per_m = len(confirmed) / (total / 1_000_000) if total else 0
+        print(f"  Tokens:     {total:.0f} spent | {per_m:.2f} vulns/1M-tokens"
+              + (" (log spends: tokens.py log)" if not total else ""))
+    except Exception:
+        pass
+    fp = load_json(FINGERPRINTS_FILE) or {}
+    if fp:
+        print(f"  Fingerprints: {len(fp)} host(s) cached")
+    # Blind-spot visibility: classes with no methodology and no ground truth
+    try:
+        from cross_index import gaps_only
+        gaps = gaps_only()
+        if gaps:
+            print(f"  Blind spots: {len(gaps)} class(es) uncovered "
+                  f"({', '.join(gaps[:4])}{'...' if len(gaps) > 4 else ''}) — cross_index.py map")
+        else:
+            print("  Blind spots: none (full class coverage)")
+    except Exception:
+        pass
+    debrief_hint = "debrief.py debrief"
+    print("=" * 60)
+    print(f"  Next: leads | chains | tokens.py report | {debrief_hint} (at close-out)")
+
+
+def run_nuclei(target: str, templates: str = "", severity: str = "", background: bool = False, config: str = None):
+    """nuclei integration: the community 1-day template corpus fired at an
+    in-scope target. Every matcher hit becomes a `cve` lead flagged
+    must_verify (a template match is a CANDIDATE, never a finding — the
+    verification gate still applies). No silent drops: a missing nuclei
+    binary files an explicit lead so the coverage gap is visible.
+
+    Templates default to the installed nuclei template dir if -templates is
+    omitted; `-config` pins a config file (never 'auto' uploads).
+    """
+    import shutil as _shutil
+    ensure_blackboard_dirs()
+
+    if verify_scope().startswith("TAMPERED"):
+        print(tamper_notice(), file=sys.stderr)
+        sys.exit(1)
+
+    scope = load_json(SCOPE_FILE)
+    if not is_target_in_scope(target, scope):
+        print(f"[!] SCOPE ERROR: Target '{target}' is not permitted by .blackboard/scope.json",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not _shutil.which("nuclei"):
+        # No silent drop: file a lead so the operator sees the gap.
+        pointer_id = f"MSG_{uuid.uuid4().hex[:8].upper()}"
+        (ARTIFACTS_DIR / f"{pointer_id}.log").write_text(
+            f"--- COMMAND ---\nnuclei scan (unavailable)\n\n--- STDOUT ---\n"
+            f"nuclei binary not found on PATH\n\n--- STDERR ---\n")
+        with json_transaction("board.json", create=True) as board:
+            if board is not None:
+                board.setdefault("leads", []).append({
+                    "id": f"LEAD_{uuid.uuid4().hex[:6].upper()}",
+                    "type": "cve",
+                    "value": "nuclei template scan (COVERAGE GAP)",
+                    "signal": "nuclei not installed — community 1-day corpus not fired",
+                    "confidence": 0.0,
+                    "suggested_next": "install nuclei to close the coverage gap",
+                    "must_verify": False,
+                    "preconditions": [],
+                    "source_pointer": pointer_id,
+                    "status": "new",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                })
+        print("[!] nuclei is not installed — filed a coverage-gap lead on the board "
+              "instead of silently skipping.", file=sys.stderr)
+        sys.exit(1)
+
+    cmd_parts = ["nuclei", "-target", target, "-json", "-silent"]
+    if templates:
+        cmd_parts += ["-templates", templates]
+    if severity:
+        cmd_parts += ["-severity", severity]
+    if config:
+        cmd_parts += ["-config", config]
+    cmd = " ".join(shlex.quote(p) for p in cmd_parts)
+    pointer_id = f"MSG_{uuid.uuid4().hex[:8].upper()}"
+    print(f"[*] Nuclei scan [{pointer_id}]: {cmd}")
+
+    if background:
+        launch_background(cmd, target, pointer_id)
+        print(f"[*] Backgrounded [{pointer_id}] — results + leads land on the board when done.")
+        return
+
+    execute_and_log(cmd, pointer_id, load_canary_token())
+    trigger_triage(pointer_id)
+
+    # Parse the JSONL artifact into cve leads (deterministic, no re-read).
+    art = (ARTIFACTS_DIR / f"{pointer_id}.log").read_text()
+    m = re.search(r"--- STDOUT ---\n(.*?)\n--- STDERR ---", art, re.DOTALL)
+    hits = []
+    for line in (m.group(1).splitlines() if m else []):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        tid = obj.get("template-id") or obj.get("templateID") or "unknown-template"
+        matches = obj.get("matched-at") or obj.get("host") or target
+        hits.append((tid, matches, str(obj.get("info", {}).get("severity", ""))))
+    if hits:
+        leads = []
+        for tid, matched, sev in hits:
+            leads.append({
+                "id": f"LEAD_{uuid.uuid4().hex[:6].upper()}",
+                "type": "cve",
+                "value": f"nuclei: {tid} @ {matched}",
+                "signal": f"template match ({sev or 'unrated'})",
+                "confidence": 0.55,
+                "suggested_next": "verify version condition + build PoC before any confirmation",
+                "must_verify": True,
+                "preconditions": [],
+                "source_pointer": pointer_id,
+                "status": "new",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+        with json_transaction("board.json") as board:
+            if board is not None:
+                board.setdefault("leads", []).extend(leads)
+        print(f"[✔] {len(hits)} nuclei match(es) filed as must_verify cve leads "
+              f"(verify before confirming).")
+    else:
+        print("[*] No template matches.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Security Flow Execution Engine")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    # status (one-glance engagement dashboard)
+    subparsers.add_parser("status", help="Engagement dashboard: scope, findings, leads, chains, tokens")
 
     # run
     run_parser = subparsers.add_parser("run", help="Run command and log artifacts")
@@ -774,6 +1442,24 @@ if __name__ == "__main__":
                               help="Inline proof: the payload / request+response that proves impact")
     asset_parser.add_argument("--evidence-from", dest="evidence_from",
                               help="Pointer ID whose artifact log is the evidence for this finding")
+    asset_parser.add_argument("--chain-to", dest="chain_to", default=None,
+                              help="Comma-separated prior FINDING_ IDs this finding chains from (attack-path edge)")
+
+    # chains (view/edit the finding chain graph — chain-mining substrate)
+    chains_parser = subparsers.add_parser("chains", help="View or edit the finding chain graph")
+    chains_parser.add_argument("--link", help="Directed edge FINDING_A,FINDING_B (A enables B)")
+    chains_parser.add_argument("--unlink", help="Remove edge FINDING_A,FINDING_B")
+    chains_parser.add_argument("--note", default="", help="Annotation for the --link edge")
+    chains_parser.add_argument("--mine", action="store_true",
+                                help="Propose edges from primitive/needs matching (deterministic)")
+    chains_parser.add_argument("--plan", action="store_true",
+                                help="B1: multi-hop capability-graph planning toward --goal")
+    chains_parser.add_argument("--goal", default=None,
+                                help="Named post-condition: RCE | data_exfil | auth_bypass | priv_esc")
+    chains_parser.add_argument("--top", type=int, default=3,
+                                help="Top-N paths for --plan (default 3)")
+    chains_parser.add_argument("--auto-link", dest="auto_link", action="store_true",
+                                help="With --mine/--plan: link evidence-backed hops into chain_to (guarded); unproven -> hypo_edges")
 
     # scope (WS2: per-project scope + subdomain approval)
     scope_parser = subparsers.add_parser("scope", help="View or edit engagement scope")
@@ -832,17 +1518,50 @@ if __name__ == "__main__":
         "detect", help="Detect source trees/manifests (analyze auto-wire for SAST+SCA)")
     detect_parser.add_argument("--path", "-p", default=".")
 
+    # nuclei (community 1-day template corpus -> must_verify cve leads)
+    nuclei_parser = subparsers.add_parser(
+        "nuclei", help="Fire the nuclei template corpus at an in-scope target (matches -> cve leads)")
+    nuclei_parser.add_argument("--target", required=True, help="In-scope target URL/host")
+    nuclei_parser.add_argument("--templates", default="", help="Template dir/file (default: nuclei's installed set)")
+    nuclei_parser.add_argument("--severity", default="", help="Severity filter (e.g. critical,high)")
+    nuclei_parser.add_argument("--background", "--bg", action="store_true", dest="background",
+                               help="Run detached; leads land on the board when done")
+    nuclei_parser.add_argument("--config", default=None, help="Pinned nuclei config file (never auto)")
+
+    # fingerprint (target tech cache — record/lookup)
+    fp_parser = subparsers.add_parser("fingerprint", help="Target tech/version cache (never re-learn a stack)")
+    fp_parser.add_argument("--host", help="Host to record/lookup")
+    fp_parser.add_argument("--tech", default="", help="Tech/version observation to record (with --host)")
+    fp_parser.add_argument("--record", action="store_true",
+                           help="Record --tech for --host instead of looking up")
+    fp_parser.add_argument("--all", action="store_true", help="List every cached host")
+    fp_parser.add_argument("--fresh-only", dest="fresh_only", action="store_true", default=True)
+
     args = parser.parse_args()
 
     if args.subcommand == "run":
         run_command(args.cmd, args.target, args.background)
+    elif args.subcommand == "status":
+        workspace_status()
     elif args.subcommand == "_bg-exec":
         bg_exec(args.cmd, args.target, args.pointer)
     elif args.subcommand == "inspect":
         inspect_artifact(args.id, args.grep, args.json_key, args.lines)
     elif args.subcommand == "add-asset":
         add_asset_to_board(args.host, args.endpoint, args.port, args.finding, args.details,
-                           args.severity, args.status, args.poc, args.evidence_from)
+                           args.severity, args.status, args.poc, args.evidence_from,
+                           args.chain_to)
+    elif args.subcommand == "chains":
+        if args.plan:
+            if not args.goal:
+                print("[!] --plan requires --goal (RCE|data_exfil|auth_bypass|priv_esc)",
+                      file=sys.stderr)
+                sys.exit(1)
+            plan_chains(args.goal, args.top, args.auto_link)
+        elif args.mine:
+            mine_chains(auto_link=args.auto_link)
+        else:
+            manage_chains(args.link, args.unlink, args.note)
     elif args.subcommand == "scope":
         manage_scope(args.add_host, args.add_domain, args.add_cidr, args.add_code_path,
                      args.approve, args.do_list)
@@ -866,3 +1585,26 @@ if __name__ == "__main__":
             intel.run_sca(args.path, offline=args.offline)
         else:
             intel.run_detect(args.path)
+    elif args.subcommand == "nuclei":
+        run_nuclei(args.target, args.templates, args.severity, args.background, args.config)
+    elif args.subcommand == "fingerprint":
+        if args.all:
+            fp = load_json(FINGERPRINTS_FILE) or {}
+            if not fp:
+                print("[*] Fingerprint cache is empty.")
+            for host, entries in fp.items():
+                print(f"  {host}:")
+                for e in entries:
+                    print(f"    {e.get('tech')}  ({e.get('source')}, {e.get('recorded_at')})")
+        elif args.host and args.record and args.tech:
+            record_fingerprint(args.host, args.tech)
+            print(f"[✔] Fingerprint recorded: {clean_host(args.host)} -> {args.tech}")
+        elif args.host:
+            entries = lookup_fingerprints(args.host, fresh_only=args.fresh_only)
+            if not entries:
+                print(f"[*] No fresh fingerprints for {clean_host(args.host)} "
+                      f"(record one: fingerprint --host <h> --tech '<banner>' --record)")
+            for e in entries:
+                print(f"  {e.get('tech')}  ({e.get('source')}, {e.get('recorded_at')})")
+        else:
+            print("[*] Usage: fingerprint --host <h> [--tech '<obs>' --record] | --all")

@@ -164,6 +164,18 @@ def generate_individual_reports():
         poc_block = evidence_poc.strip() if evidence_poc else (
             "_No inline PoC captured — see the reproduction commands and evidence log below._"
         )
+
+        # Chain context: if this finding links into a larger path, show it —
+        # composed impact is the real severity story.
+        chain_bits = []
+        for nxt in finding.get("chain_to", []) or []:
+            nt = next((f.get("title") for f in findings if f.get("id") == nxt), nxt)
+            note = (finding.get("chain_notes", {}) or {}).get(nxt, "")
+            chain_bits.append(f"  - enables `{nxt}` — {nt}" + (f" _({note})_" if note else ""))
+        chain_section = ("\n## Chain Impact (this finding enables)"
+                         + ("\n".join(chain_bits) if chain_bits
+                            else "\n_Standalone finding (no chain edges; see SUMMARY for paths)._")
+                         + "\n") if chain_bits else ""
         report_lines = [
             f"# Vulnerability Advisory: {title}",
             f"**Advisory ID:** `{finding_id}`  ",
@@ -185,6 +197,7 @@ def generate_individual_reports():
             "```text",
             extract_juicy_details("\n".join(evidence_buffer)),
             "```",
+            chain_section,
             "\n## 5. Remediation & Defense",
             "- **Input Validation:** Enforce strict type, length, and format whitelisting on all incoming fields.",
             "- **Access Control:** Verify authentication and authorization checks on the server side prior to processing data.",
@@ -228,6 +241,58 @@ def generate_individual_reports():
                 f"- **[{sev}]** {f.get('title', 'Observation')} — {f.get('details', '')} "
                 f"_(no PoC/evidence; verify before reporting)_"
             )
+
+    # Demonstrated attack paths (chain graph): composed impact > isolated findings.
+    edges = []
+    by_id = {f.get("id"): f for f in findings}
+    for f in findings:
+        for b in f.get("chain_to", []):
+            note = f.get("chain_notes", {}).get(b, "")
+            edges.append((f.get("id"), b, note))
+    # B1: hypo_edges (planner-proposed, UNPROVEN) render in a separate labeled
+    # section — never inside Demonstrated. Labels resolve for findings AND leads
+    # (no bare LEAD_xxx / dangling nodes).
+    from chain_planner import label_for as _label_for
+    hypo = []
+    for e in board_data.get("hypo_edges", []):
+        a, b = e.get("from"), e.get("to")
+        if a and b:
+            hypo.append((a, b, e.get("why", "")))
+    summary_lines.append("\n## Demonstrated Attack Paths (finding chains)")
+    if not edges:
+        summary_lines.append("_No chains recorded — see `sec_flow.py chains --mine` to compose impact._")
+    else:
+        graph = {}
+        for a, b, _ in edges:
+            graph.setdefault(a, []).append(b)
+
+        def walk(start, path=None):
+            path = path or [start]
+            best = [path]
+            for nxt in graph.get(start, []):
+                if nxt in path:
+                    continue
+                best.append(walk(nxt, path + [nxt]))
+            return max(best, key=len)
+
+        longest = []
+        for fid in by_id:
+            p = walk(fid)
+            if len(p) > len(longest):
+                longest = p
+        for a, b, note in edges:
+            ta = (by_id.get(a, {}).get("title") or "?")[:60]
+            tb = (by_id.get(b, {}).get("title") or "?")[:60]
+            summary_lines.append(f"- `{a}` **{ta}** → `{b}` **{tb}**" + (f" — _{note}_" if note else ""))
+        if len(longest) > 1:
+            steps = " → ".join(f"`{fid}`" for fid in longest)
+            summary_lines.append(f"\n**Longest demonstrated path ({len(longest)} steps):** {steps}")
+    if hypo:
+        summary_lines.append("\n## Hypothesized Paths (UNPROVEN — planner proposals)")
+        summary_lines.append("_Hypo edges never count as demonstrated impact; confirm hops with evidence to promote them._")
+        for a, b, why in hypo[:12]:
+            la, lb = _label_for(a, board_data), _label_for(b, board_data)
+            summary_lines.append(f"- ~~`{a}` **{la}** ~~> `{b}` **{lb}**~~ — _{why[:100]}_")
 
     # Coverage gaps (no-silent-drops): every lead that never reached a terminal
     # state is an explicit blind spot in this engagement — surface them so

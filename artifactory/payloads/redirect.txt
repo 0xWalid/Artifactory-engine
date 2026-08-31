@@ -1,0 +1,7 @@
+https://evil.example/
+//evil.example/
+/\/\/evil.example/
+https://target.example@evil.example/
+javascript:alert(1)
+data:text/html,<script>alert(1)</script>
+https://target.example.evil.example/

@@ -5,7 +5,7 @@
 # parameterized .md playbook (fetch -> quality-gate -> approval -> save).
 # Lines starting with # are comments and are skipped on ingest.
 # Regenerate with: playbook_engine.py --export-urls [--category <cat>]
-# Generated from knowledge/sources.json (60 sources).
+# Generated from knowledge/sources.json (70 sources).
 
 # --- web ---
 # James Kettle — full research portfolio
@@ -52,6 +52,16 @@ https://www.gosecure.net/blog/2019/07/16/abusing-xxe-in-office-files-to-exfiltra
 https://labs.detectify.com/
 # PortSwigger Research index (all papers)
 https://portswigger.net/research
+# HTTP/2 request smuggling (browser desync research)
+https://portswigger.net/research/http2-request-smuggling
+# h2c smuggling: request smuggling via h2c upgrade
+https://daniel.haxx.se/blog/2022/02/02/h2c-smuggling/
+# Log4Shell anatomy: JVM message-lookup exploitation
+https://www.lunasec.com/2021/12/09/log4j-zero-day-exploited/
+# Intigriti Bug Bytes
+https://blog.intigriti.com/category/bugbytes/
+# Pentester Land — writeups directory
+https://pentester.land/writeups/
 
 # --- recon ---
 # The Bug Hunter's Methodology (TBHM) repo
@@ -80,6 +90,8 @@ https://portswigger.net/web-security/oauth
 https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/06-Session_Management_Testing/
 # Password Reset Poisoning (host header)
 https://portswigger.net/web-security/host-header/exploiting/password-reset-poisoning
+# Sam Curry: Mastercard/Adform OAuth bugs writeup
+https://samcurry.net/mastercard-bugs/
 
 # --- logic ---
 # OWASP API Security Top 10
@@ -92,6 +104,10 @@ https://github.com/JHaddix/HUNT
 https://www.bugbountyhunter.com/methodology/zseanos-methodology.pdf
 # GraphQL Threat Matrix
 https://github.com/dolevf/graphql-threat-matrix
+# HackerOne disclosed: IDOR reports collection (hacktivity)
+https://hackerone.com/reports?query=IDOR&order_direction=DESC&state=public
+# Race conditions in web apps (last-mile delivery)
+https://portswigger.net/research/race-conditions
 
 # --- infra ---
 # Google Project Zero blog
@@ -110,6 +126,8 @@ https://lolbas-project.github.io/
 https://mas.owasp.org/
 # Top 10 CI/CD Security Risks
 https://github.com/cider-security-research/top-10-cicd-security-risks
+# Assetnote: Attacking the Internet's Core Routers
+https://blog.assetnote.io/2023/07/25/targeting-internet-core-routers/
 
 # --- intel ---
 # Trickest CVE repository (POCs by CVE)
@@ -142,3 +160,7 @@ https://github.com/bugcrowd/bugcrowd_university
 https://trailofbits.github.io/ctf/
 # pwn.college
 https://pwn.college/
+
+# --- chaining ---
+# Orange Tsai: ProxyLogon (MS Exchange SSRF+auth chain)
+https://blog.orange.tw/2021/08/proxylogon-a-pre-auth-rce-chain-against-ms-exchange/

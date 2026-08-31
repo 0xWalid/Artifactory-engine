@@ -31,7 +31,25 @@ artifactory-engine/
 ├── README.md                   <-- Documentation
 └── artifactory/                <-- Core Engine Pipeline
     ├── init_env.py             <-- Workspace initializer (creates .blackboard/, schemas, scope, canary)
-    ├── sec_flow.py             <-- Safe runner, fail-closed scope gate, canary + destructive guards, log inspection & asset tracker
+    ├── sec_flow.py             <-- Safe runner, fail-closed scope gate + HMAC scope signing, canary + destructive guards, rate limiter, nuclei bridge, fingerprint cache, chain graph
+    ├── scope_sig.py            <-- Scope tamper-evidence library (HMAC-sign/verify scope.json; key outside workspace)
+    ├── auth_manager.py         <-- Auth-state manager (sessions-as-pointers) + role-diff BAC/IDOR engine
+    ├── oob.py                  <-- OOB callback engine: tagged payloads, HTTP+DNS listener, attribution
+    ├── tokens.py               <-- Token ledger: per-role budgets + proven-vulns-per-1M-tokens metric
+    ├── eval_engine.py          <-- Learning loop: engine suite, engagement score + A/B compare, lab manifests (incl. hold-out), promotion gate
+    ├── vuln_lab.py             <-- Seeded lab 1 (BAC/IDOR/blind-SSRF/anomaly; ground truth)
+    ├── vuln_lab2.py            <-- Seeded lab 2 (secret-in-JS/redirect/traversal/mass-assign)
+    ├── vuln_lab3.py            <-- HOLD-OUT lab 3 (header-bypass/debug-leak/CORS — final gate only)
+    ├── burp_bridge.py         <-- Burp Suite bridge: history->inventory, scanner issues->leads, Pro REST scan driver
+    ├── zap_bridge.py          <-- Headless ZAP fallback (docker one-shot, same lead contract)
+    ├── crawl.py                <-- Deterministic endpoint crawler (auto-builds role-diff inventory)
+    ├── debrief.py              <-- Automated post-engagement debrief + episodic lessons store
+    ├── patch_diff.py           <-- 1-day variant engine: upstream fix diff -> sink extraction -> hunt leads
+    ├── metrics.py              <-- Global metrics rollup (cross-engagement trend curve)
+    ├── interaction_growth.py  <-- Advisory co-occurrence mining -> new interaction-pair proposals
+    ├── component_aliases.py    <-- Product -> embedded-component map (appliance intel broadening)
+    ├── fuzz_driver.py          <-- Grammar fuzzing + libFuzzer harness scaffolding
+    ├── redact.py               <-- Egress redaction layer (secrets never leave the engine in context)
     ├── playbook_engine.py      <-- Parameterized playbook renderer, research-library suggestions & methodology-synthesis trigger
     ├── ingest.py               <-- Tradecraft parameterizer, quality-checker & writer
     ├── report_engine.py        <-- Per-finding advisory, evidence-log & coverage-gap generator (auto-run on new findings)
@@ -44,9 +62,9 @@ artifactory-engine/
         ├── web/                <-- Web app testing procedures
         ├── auth/               <-- Authentication & session checks
         ├── infra/              <-- Cloud & infrastructure playbooks
-        ├── logic/              <-- Business logic & access control flaws
-        ├── chaining/           <-- Multi-vector chaining strategies
-        └── sast/               <-- Guided disproof questions per bug class
+        ├── logic/              <-- Business logic & access control flaws (role_diff methodology)
+        ├── chaining/           <-- Multi-vector chaining strategies (chain_methodology)
+        ├── sast/               <-- Guided disproof questions per bug class + fuzz-harness generation
 ```
 
 ---
@@ -185,8 +203,14 @@ Three hard interlocks are enforced in the runner, and refusals are surfaced (nev
 * **`[!] SCOPE ERROR`** — target not authorized in `.blackboard/scope.json`.
 * **`[!] CANARY TRIPWIRE`** — a command references the workspace canary token (do-not-touch data); a post-run scan also flags `CANARY TRIPWIRE HIT` and logs it if the token appears in output.
 * **`[!] DESTRUCTIVE-ACTION BLOCK`** — irreversible host/data destruction (`rm -r/-f`, `dd`, `mkfs*`, `shutdown`/`reboot`, raw-disk writes, fork bombs), gated on `DESTRUCTIVE_WRITE` in `scope.json` `disallowed_actions`.
+* **`[!] SCOPE SIGNATURE INVALID`** — scope.json's authorization fields (hosts/domains/cidrs/code_paths/actions) are HMAC-signed with a key stored OUTSIDE the workspace (`~/.artifactory/scope_signing.key`, 0600). Silent tampering fails every gate; operator-driven scope edits (`scope --add-*`, `--approve`, subdomain auto-expansion) re-sign automatically. Legacy unsigned workspaces still run — re-run `init_env.py` to enable tamper evidence.
 
-Every command also runs under a wall-clock timeout so a hung tool cannot stall the engine.
+Every command also runs under a wall-clock timeout so a hung tool cannot stall the engine, and an optional **per-host rate limiter** (`scope.json` → `rate_limit.min_interval_seconds`) paces consecutive commands against the same host in code — not policy text.
+
+### 1-Day Template Corpus & Target Fingerprints (`sec_flow.py nuclei|fingerprint`)
+
+* `nuclei --target <t>` fires the community template corpus at an in-scope target; every matcher hit becomes a `must_verify` `cve` lead (a template match is a candidate, never a finding — the verification gate still applies). If nuclei isn't installed, a visible coverage-gap lead is filed — no silent drops.
+* `fingerprint --host <h> --tech '<banner>' --record` / `fingerprint --host <h>` caches target tech per host (14-day TTL) so a stack is never re-learned twice; `--all` lists the cache. Recon consults the cache before re-probing; CVE enumeration can key off it.
 
 ### Operating Policy (authorized targets only)
 
@@ -232,6 +256,9 @@ The engine runs as a team over the shared blackboard (writes are OS-lock-seriali
 * **`recon`** (background) — passive-first, trigger-based discovery; feeds leads, logs nothing.
 * **`exploit`** — tests one hypothesis, captures the proving pointer/PoC.
 * **`verifier`** — confirms true-positives from evidence and writes the advisory.
+* **`skeptic`** — the adversary in the escalation ladder: attacks the evidence behind a proposed confirmed finding (innocent explanations, repro faults, severity inflation). A high-impact claim should SURVIVE the skeptic before it reaches the report.
+
+**Escalation ladder** (cheap second opinions before expensive ones): deterministic re-inspect → exploit/verifier re-derivation → skeptic review → operator. Stuck-detection and disagreement escalate up the ladder; each rung costs more than the last, so the cheap ones run first.
 
 Every action can be journaled so the report explains *why it did what and how each result was reached*:
 
@@ -251,6 +278,107 @@ The expensive operator model should make decisions, not read the firehose of too
 
 * **Operator** (your interactive agent) — consumes only a short, ranked **leads** list and drives strategy/exploitation.
 * **Scout** (background) — digests every command's raw output into leads on `board.json`. It is **deterministic-first** (endpoints, open ports, subdomains, tech banners, and high-signal anomalies like SQL errors or leaked `/etc/passwd` are parsed for free, instantly), with an **optional cheap/free model** for smarter ranking.
+
+### Auth-State Manager & Role-Diff (`auth_manager.py`)
+
+Sessions are first-class blackboard artifacts: credentials live in `.blackboard/sessions/<SESS_ID>.json`, the board keeps only pointers — auth state never bloats context. Roles form a matrix (anon + every authenticated role), with optional refresh hooks for rotating tokens.
+
+**Role-diff** is the mechanical BAC/IDOR sweep: replay the endpoint inventory under every role, normalize volatile content (CSRF tokens, nonces, timestamps — deterministic, not LLM), and every response DELTA lands as a `rolediff` lead. Broken access control is OWASP #1 and invisible to injection scanners; this finds it at near-zero token cost.
+
+```bash
+python3 ~/artifactory-engine/artifactory/auth_manager.py add --role admin --auth-type cookie \
+  --target "http://127.0.0.1:8080" --credential "session=admin-abc"
+python3 ~/artifactory-engine/artifactory/auth_manager.py role-diff --base-url "http://127.0.0.1:8080" \
+  --roles SESS_XXXXXX,SESS_YYYYYY --endpoints endpoints.txt   # baseline first
+```
+
+### OOB Callback Engine (`oob.py`)
+
+Blind-vulnerability confirmation (SSRF/XXE/SSTI/blind-RCE) with payload-tag attribution and no external infrastructure: mints tagged probe URLs, runs an HTTP+DNS listener, and files every callback as a high-confidence anomaly lead tied to its originating probe. For internet-facing targets, point payloads at interactsh and keep the same tag discipline.
+
+```bash
+python3 ~/artifactory-engine/artifactory/oob.py generate --host <listener-host> --purpose "blind SSRF via importer"
+python3 ~/artifactory-engine/artifactory/oob.py listen        # or --dns for the DNS observer
+python3 ~/artifactory-engine/artifactory/oob.py status         # poll hits -> leads
+```
+
+### Token Accounting (`tokens.py`) — the north-star metric
+
+Every model spend is ledgered (`.blackboard/tokens.jsonl`) by role and purpose, with per-role budgets and the framework's optimization target: **proven vulns per 1M tokens**.
+
+```bash
+python3 ~/artifactory-engine/artifactory/tokens.py log --role operator --purpose "recon phase" --amount 12000
+python3 ~/artifactory-engine/artifactory/tokens.py budget --role operator --limit 200000
+python3 ~/artifactory-engine/artifactory/tokens.py report      # spend breakdown + north-star
+```
+
+### Chain Graph (`sec_flow.py chains`) — finding composition
+
+Findings carry directed chain edges (`--chain-to` on `add-asset`, or `chains --link A,B --note ...`); `chains` renders every demonstrated attack path and highlights the longest — leaked token → auth bypass → IDOR → data reach becomes a walkable graph, not prose. Chain methodology lives in `prompts/chaining/chain_methodology.md` (when does A's primitive satisfy B's need?).
+
+### Eval Loop: Lab Suite, Scoring, Promotion Gate (`vuln_lab*.py` + `eval_engine.py`)
+
+The learning flywheel, eval-gated end to end — **labs only for promotion; live engagements feed scores but never promote**:
+
+* **Lab 1** (`vuln_lab.py`, :8099): BAC, IDOR, blind SSRF, anomaly leak. **Lab 2** (`vuln_lab2.py`, :8100): secret-in-JS, open redirect, path traversal, mass-assignment — a different bug flavor so the gate can't overfit one lab. **Lab 3** (`vuln_lab3.py`, :8101) is **HOLD-OUT**: header auth bypass, debug leak, CORS misconfig; only `eval_engine.py gate --final` ever touches it.
+* **Engine suite** (`eval_engine.py suite engine`): 30 deterministic machinery checks — scope gate, signing (tamper + sig-deletion), destructive block, verification gate, triage, role-diff, OOB attribution, token ledger, chains, rate limiter, fingerprints, nuclei (mocked real path + coverage-gap), redaction, crawler, mining, report rendering.
+* **Scoring** (`eval_engine.py score --label <run>`): north-star + precision + coverage, appended to `evals/scores.jsonl`; **`compare`** A/B-diffs the last two runs (deterministic verdict: B WINS / REGRESSION / EQUIVALENT).
+* **Promotion**: `gate --candidate <x>` (labs 1-2 iteration) → `gate --final` (engine suite + hold-out lab3). Candidates that regress anything are rejected; every decision lands in `evals/manifest.json`.
+
+### Burp Suite Bridge (`burp_bridge.py`) — Burp-first, any edition
+
+Your manual Burp browsing is the engine's baseline inventory, at zero token cost:
+
+* **`ingest-history --file history.xml`** — Burp "Save items" export → unique `endpoint` leads + raw traffic stored as a verifiable evidence artifact + `endpoints.txt` (the role-diff baseline). Out-of-scope hosts in the history are flagged, never silently dropped. Workflow: browse as the highest-privilege role → ingest → `role-diff` replays your surface across every other role.
+* **`ingest-issues --file issues.xml`** — Burp Pro Scanner issues export → `must_verify` leads (scanner candidates are never findings; the verification gate applies).
+* **`scan --target <url>`** — drives a scan via Burp Pro's REST API (:1337), polls, files issues as leads; API unreachable → visible coverage-gap lead.
+* ZAP remains the headless docker fallback (`zap_bridge.py --target <url>`), same lead contract — scanners are swappable behind the same board interface.
+
+```bash
+python3 ~/artifactory-engine/artifactory/burp_bridge.py ingest-history --file history.xml
+python3 ~/artifactory-engine/artifactory/auth_manager.py role-diff --base-url <base> \
+  --roles SESS_ADMIN,SESS_USER --endpoints endpoints.txt
+```
+
+### Compound Metrics & Growth Tools
+
+* **Global metrics** (`metrics.py scan|show`): every workspace's scores roll into one cross-engagement history (`~/.artifactory/metrics_history.jsonl`) with a first-half vs recent-half trend — the actual "getting better" curve on the north-star metric.
+* **Interaction-table growth** (`interaction_growth.py mine|local`): NVD advisory co-occurrence mining proposes new component pairs with CVE evidence; approvals land in `knowledge/interactions_local.json` (loaded on top of built-ins, which now include HTTP/2/h2c classes).
+* **Component aliasing** (`component_aliases.py`): product → embedded-component map (gitlab→nginx/workhorse/...); intel hints embedded-component broadening for appliances.
+* **Fuzz driver** (`fuzz_driver.py grammar|scaffold`): deterministic mutation fuzzing of request seeds against in-scope targets (anomaly leads on 5xx/hangs) + libFuzzer C harness scaffolding for white-box campaigns.
+* **Per-payload IDs** (`payload_corpus.py`): P1..Pn per line; `note --payload-id` for fine-grained wins (families stay primary).
+* **Watch mode** (`maintenance.py --watch N`): freshness loop on a poll interval (≥300s floor).
+* **Skeptic contract** (lab3 manifest): a confirmed finding without evidence structurally fails the hold-out gate — the skeptic can't argue its way past proof.
+
+### Researcher Behaviors (freshness, prioritization, interactions, corpus)
+
+* **Source freshness** (`playbook_engine.py --refresh`): every built source's page is content-hashed; changed pages re-queue into the pending synthesis worklist. The research library is live, not a snapshot. Sources carry quality tiers (primary/advisory/report/guide).
+* **CISA KEV** (`kev.py mark|list`): board cve leads matching the known-exploited catalog become PRIORITY-1 (conf 0.85) — real-world prioritization, cached for offline runs.
+* **Stack-interaction hypotheses** (`stack_interactions.py hypothesize|pairs`): fingerprint pairs (nginx+tomcat, cache+app, parser+parser...) become must_verify leads — smuggling/poisoning/differential candidates. Researchers attack where components meet.
+* **Variant propagation** (automatic on confirm): a confirmed finding queues same-class sweeps across the endpoint inventory — the "test every object endpoint" reflex, in code.
+* **Payload corpus** (`payload_corpus.py list|note|retire-review`): curated, tagged payloads ranked by proven wins per stack; debrief feeds it, retirement review flags dead families.
+* **Dead-ends store** (`debrief.py deadends`): negative knowledge — classes that died on a stack, with kill reasons, consulted before re-burning tokens.
+* **CVE→patch auto-chain**: intel leads carry OSV FIX references; hand the commit URL to `patch_diff.py --diff` to hunt the same bug family on your surface.
+* **Lab mutation** (`vuln_lab*.py --seed N`): paths/cookies/IDs/header-names jitter deterministically — evals can't be passed by memorization. Same seed = same lab (reproducible scoring).
+* **Maintenance** (`maintenance.py [--suite]`): the cron-able freshness loop — source re-hash, KEV refresh, fingerprint prune, retirement flags (+ optional suite).
+
+* **Crawler** (`crawl.py`): deterministic endpoint discovery (HTML links + JS route literals) that auto-builds the role-diff inventory — the BAC/IDOR sweep is now hands-off, zero model tokens, scope-gated with politeness pacing.
+* **Debrief** (`debrief.py`): deterministic post-engagement analysis (lead-type conversion, coverage gaps, token efficiency, chain discipline) → REVIEW CARD for human approval → persisted to the episodic lessons store (`.blackboard/lessons.jsonl` + global `~/.artifactory/lessons.jsonl`). Browse with `debrief.py lessons`.
+* **Patch-diff 1-day engine** (`patch_diff.py`): upstream security-fix diff/advisory → bug-class sink extraction (deterministic) → variant-hunt commands for your codebase as `cve` leads.
+* **Chain mining** (`sec_flow.py chains --mine`): deterministic primitive/needs matching proposes composition edges ("leaked credential → auth bypass"); accept with `--link` or `--auto-link`.
+* **Redaction layer** (`redact.py`): everything the engine emits (previews, inspect output) is scrubbed of cookies/bearer tokens/JWTs/private keys/session credentials; raw artifacts stay byte-identical for verification.
+
+```bash
+python3 ~/artifactory-engine/artifactory/vuln_lab.py --port 8099 --selfcheck   # lab 1 ground truth
+python3 ~/artifactory-engine/artifactory/vuln_lab2.py --port 8100 --selfcheck  # lab 2 (different flavor)
+python3 ~/artifactory-engine/artifactory/eval_engine.py suite engine           # 30 machinery checks
+python3 ~/artifactory-engine/artifactory/eval_engine.py score                  # north-star
+python3 ~/artifactory-engine/artifactory/eval_engine.py compare               # A/B the last two runs
+python3 ~/artifactory-engine/artifactory/eval_engine.py gate --candidate "role-diff playbook v2"
+python3 ~/artifactory-engine/artifactory/eval_engine.py gate --candidate "v2" --final  # + hold-out lab 3
+```
+
+
 
 Run heavy enumeration detached so nothing blocks, then pull the digest:
 
@@ -290,3 +418,48 @@ python3 ~/artifactory-engine/artifactory/sec_flow.py add-asset --endpoint "/api/
 python3 ~/artifactory-engine/artifactory/sec_flow.py add-asset --finding "Exposed Metrics Endpoint" --details "Found unprotected /metrics route"
 
 ```
+
+---
+
+# The Newest Layer: Ground Truth on Demand, Knowledge Quality & Operator Interop
+
+## Bug greenhouse & playbook acceptance (knowledge tested before use)
+- **Greenhouse** (`greenhouse.py list|grow <class>|grow-all`) — 14 planted-bug recipes (web-core: xss/sqli/traversal/ssrf · logic: bac/idor/mass-assignment/race · auth: jwt-alg-none/weak-tokens/oauth-redirect · advanced: ssti/xxe/deser). Every lab selfchecks; every class has a deterministic evidence marker.
+- **Acceptance harness** (`eval_engine.py acceptance --category <c> --name <n>`) — a new/revised methodology must map to greenhouse ground truth, the planted vuln must selfcheck, and the playbook must reference the observable signature. Verdicts: ACCEPTED / GROUND-TRUTH-ONLY / NO-RECIPE / SELF-CHECK-FAILED.
+- **PoC delta miner** (`poc_delta.py mine --finding <FID> --playbook <c>/<n>`) — working-PoC-vs-playbook-steps diff → patch cards (missing steps, ingest-approval routed).
+
+## Source accountability (sources earn trust)
+- **Lineage** (`lineage.py record|reliability|apply|chain <id>|divergence <c>/<n>`) — the `source → playbook → leads → outcomes` chain is walkable; tiers are EARNED from field wins/losses per class; demotions flagged for review; step-level divergence pinpoints WHICH playbook section kills leads.
+- **Evidence hierarchy** — fix-commits (patch_diff) over prose whenever a CVE+patch exists for the class; primary-tier sources preferred in synthesis; allowlist expansion only via operator-approved proposals with provenance.
+
+## One-lookup knowledge & visibility
+- **CWE cross-index** (`cross_index.py lookup <class>|map|gaps`) — class → ground truth, methodologies, payloads, rates, lineage, dead-ends in one card; the coverage map shows blind spots pre-engagement (also surfaced in `sec_flow.py status`).
+
+## Production verification, skepticism & interop
+- **Tripwires** (`tripwires.py plant|check`) — planted decoys verify detect→redact→report in production; misses expose coverage holes.
+- **Skeptic scorecard** (`skeptic_ledger.py record|resolve|stats`) — persona-rotated skeptic verdicts vs eventual ground truth (over-kill / rubber-stamp rates).
+- **Importers** (`importers.py har|nmap|nessus|inventory-diff`) — zero-token inventory from scans you already ran; role inventory-diff finds admin-only paths.
+- **Cross-operator merge** (`board_merge.py merge --from <ws>`) — conflict-detected board merges; scope never merges.
+- **Client report** (`client_report.py export`) — self-contained HTML: CVSS templates, Mermaid attack paths, coverage honesty.
+- **Doctor** (`doctor.py [--suite|--json]`) — new-machine readiness in one command.
+- **Flight recorder** (`tokens.py flamechart`) — per-step context growth; **debrief replay** (counterfactual learning audit) and **fresh-eyes** (untried families per stack) close the loop.
+- **Latency fuzz** (`fuzz_driver.py grammar --timing`) — timing-distribution outliers catch time-based blinds.
+
+**Engine suite: dynamic count — `eval_engine.py suite engine` prints its own executed total (`suite-total`); this README cites the suite, never a stale number.** All new behavior is regression-locked.
+
+---
+
+# Master Plan Implementation (consolidate + 3 upgrades)
+
+## Part A — Consolidation
+- **Per-workflow commands**: the ~30KB monolith is now 15 lazily-loaded files (`/artifactory analyze|test|intel|scan-code|research|discover|roles|oob|chains|eval-lab|nuclei|burp|patchdiff|tokens|catalog`), each ≤4KB with a shared auto-emitted preamble. `/artifactory catalog` indexes every non-major workflow — nothing disappeared.
+- **Doc drift killed**: suite prints its own `suite-total`; single sed pass; skeptic agent deduped.
+- **Wiring self-check**: `doctor.py --wiring` — true orphan modules (undocumented AND untested) fail the doctor; libraries are exempt by list.
+
+## Part B — Upgrades
+- **B0 `model_router.py`**: role→tier routing (existing ROLES + planner) over OpenAI-compatible providers; unset/unreachable tiers fall back cheaper; no config = deterministic-only, never blocks. `.blackboard/models.json` (workspace) over `~/.artifactory/models.json` (global).
+- **B1 `chain_planner.py`**: multi-hop capability-graph planning (`chains --plan --goal RCE|data_exfil|auth_bypass|priv_esc`). Dijkstra with `-log(confidence)` weights (most-probable path), confidence floor 0.05, unconfirmed-node penalties, GOALS table with glob matching, top-N DIVERSE paths. `hypo_edges` (board-level, provenance-tagged) hold planner proposals — **never** `chain_to`; reports render Hypothesized paths separately with resolved lead labels (dashed Mermaid).
+- **B2 `mcp_broker.py`**: MCP behind the engine — schemas never enter context. stdio JSON-RPC handshake in stdlib; config at `~/.artifactory/mcp.json` (out-of-workspace, operator-approved, capability-declared); net/fs-capable servers REQUIRE in-scope `--target` per call ("passive" is a property of the call); `describe` emits arg names+types only; results = MSG_* pointers + redacted leads, treated as data.
+- **B3 `lab_runner.py` + `self_improve.py`**: headless golden-path lab play (deterministic, includes the blind-SSRF OOB flow) and the full propose pipeline (suite + labs + compare → gate). **Review card by default**; auto-merge ONLY for DATA-only diffs with `--auto-merge` + an HMAC-signed consent (workspace+ref+24h-expiry bound — expired/replayed/mismatched consents reject). Playbooks/poc-deltas are executable tradecraft → always review cards. Safety files → forced review. Merges are auditable commits; canary/replay tasks registered; install.sh re-run promotes stable.
+
+**Engine suite: 86 checks** (`eval_engine.py suite engine` prints its own total — this README cites the suite, never a stale count).
