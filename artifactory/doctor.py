@@ -17,6 +17,21 @@ from pathlib import Path
 _engine_dir = str(Path(__file__).resolve().parent)
 
 
+def _engine_root() -> Path:
+    """Engine root = the dir containing art.py (works whether this module sits
+    at the root or inside a feature package)."""
+    p = Path(__file__).resolve()
+    for anc in [p.parent, *p.parents]:
+        if (anc / "art.py").exists():
+            return anc
+    return p.parent
+
+
+_ROOT = _engine_root()
+if str(_ROOT / "core") not in sys.path:
+    sys.path.insert(0, str(_ROOT / "core"))
+
+
 def _check(name, ok, hint=""):
     return {"name": name, "ok": bool(ok), "hint": hint}
 
@@ -36,23 +51,26 @@ WIRING_EXEMPT = {
 
 
 def wiring_check(install_sh: str = None):
-    """True orphans = artifactory/*.py modules that are (a) NOT reachable from
-    any emitted command/agent doc AND (b) NOT covered by a suite check AND
-    (c) NOT on the curated library exemption list. Returns (ok, orphans)."""
-    engine = Path(_engine_dir)
+    """True orphans = engine tool modules that are (a) NOT reachable from any
+    emitted command/agent doc AND (b) NOT covered by a suite check AND (c) NOT
+    on the curated library exemption list. Module discovery is registry-driven
+    (recurses into feature packages; kernel infra art/bootstrap/registry and
+    data dirs are excluded by the registry itself). Returns (ok, orphans)."""
+    from registry import registry as _tool_registry
+
+    root = _ROOT
     if install_sh is None:
-        install_sh = str(engine.parent / "install.sh")
+        install_sh = str(root.parent / "install.sh")
 
     inst = Path(install_sh).read_text()
-    eval_src = (engine / "eval_engine.py").read_text()
+    eval_src = (Path(_tool_registry()["eval_engine"]["path"])).read_text()
 
     orphans = []
-    for mod in sorted(engine.glob("*.py")):
-        name = mod.name
-        stem = mod.stem
+    for stem, meta in sorted(_tool_registry().items()):
+        name = stem + ".py"
         if name in WIRING_EXEMPT:
             continue
-        # reachable if the module stem appears in install.sh (command/agent docs)
+        # reachable if the stem appears in install.sh (command/agent docs)
         # OR is exercised by the suite (stem mentioned in eval_engine.py checks)
         documented = stem in inst
         tested = stem in eval_src
