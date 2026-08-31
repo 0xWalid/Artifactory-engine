@@ -29,8 +29,13 @@ if [ "$ROOT_DIR" != "$STABLE_DIR" ]; then
         echo "[*] Fresh install of stable release at $STABLE_DIR"
     fi
     mkdir -p "$STABLE_ENGINE"
-    # Refresh code/knowledge/prompts; cp merges so a live .blackboard survives.
-    # --exclude needs rsync; with cp we copy then prune generated caches.
+    # Clean stale engine code before copying, but PRESERVE per-target runtime
+    # state (.blackboard/, reports/). A plain merge-copy leaves orphaned copies
+    # of every module that moved into a package -> duplicate tool stems in the
+    # registry. Removing top-level entries (except runtime dirs) first makes the
+    # deploy idempotent and refactor-safe.
+    find "$STABLE_ENGINE" -mindepth 1 -maxdepth 1 \
+        ! -name '.blackboard' ! -name 'reports' -exec rm -rf {} + 2>/dev/null || true
     cp -a "$SOURCE_ENGINE/." "$STABLE_ENGINE/"
     rm -rf "$STABLE_ENGINE/__pycache__" "$STABLE_ENGINE"/*/__pycache__ 2>/dev/null || true
     find "$STABLE_ENGINE" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true

@@ -11,3 +11,9 @@ reports/
 .env
 .venv/
 venv/
+
+# Local planning / scratch notes — not part of the shipped engine
+*_PLAN.md
+*_plan.md
+improvements_todo.md
+MASTER_PLAN.md
